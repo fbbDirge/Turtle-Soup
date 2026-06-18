@@ -2,6 +2,10 @@
 
 **Turtle Soup** 是一个基于 AI (Gemini/OpenAI) 驱动的多人在线海龟汤（情境猜谜）游戏平台。玩家需要通过提问 "是/否" 的问题来以此揭开悬疑故事背后的真相。
 
+## 📌 项目说明
+
+本项目基于 [Anduin9527/turtle-soup](https://github.com/Anduin9527/turtle-soup) 进行修改、扩展和改进开发，保留原项目的 AI 海龟汤核心玩法，并在多人房间、准备大厅、AI 配置、多渠道模型切换、中文交互和部署体验等方面进行了增强。
+
 | Dark Mode | Light Mode |
 | :---: | :---: |
 | ![Dark Mode](./assets/drak.png) | ![Light Mode](./assets/light.png) |
