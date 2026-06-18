@@ -59,6 +59,7 @@ cp .env.example .env
 *   `VITE_GEMINI_API_KEY`: 你的 LLM API Key。
 *   `VITE_GEMINI_API_URL`: API 端点 (例如 `https://api.openai.com/v1/chat/completions` 或任何兼容服务)。
 *   `VITE_ACCESS_PASSWORD`: (可选) 房间访问密码。
+*   `VITE_AI_CONFIG_PASSWORD`: (可选) AI 配置页密码；不设置时会回退使用房间访问密码。
 *   `VITE_FIREBASE_*`: 你的 Firebase 项目配置 (Key, Domain, ProjectID 等)。
 
 > **注意**: 这是一个纯前端项目 (Serverless)，你需要自行创建一个 Firebase 项目并启用 **Firestore Database** 和 **Anonymous Auth**。

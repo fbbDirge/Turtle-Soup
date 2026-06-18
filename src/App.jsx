@@ -22,9 +22,11 @@ import {
   orderBy,
   limit,
   getDocs,
+  getDoc,
   deleteDoc,
   updateDoc,
-  increment
+  increment,
+  runTransaction
 } from 'firebase/firestore';
 import {
   Terminal,
@@ -43,12 +45,21 @@ import {
   Moon,
   RefreshCw,
   Sparkles,
+  Settings,
   Loader2,
   X,
   MessageCircle, // For Mesugaki icon
   TerminalSquare // For Terminal icon
 } from 'lucide-react';
-import { callGeminiGameMaster, isGeminiConfigured, generatePuzzle } from './lib/geminiService';
+import {
+  callGeminiGameMaster,
+  isGeminiConfigured,
+  generatePuzzle,
+  getAIConfig,
+  getAIConfigState,
+  saveAIConfigState,
+  resetAIConfig
+} from './lib/geminiService';
 
 // --- Firebase Configuration & Init ---
 const firebaseConfig = {
@@ -62,12 +73,16 @@ const firebaseConfig = {
 };
 
 const ADMIN_UID = import.meta.env.VITE_ADMIN_UID;
+const requiredFirebaseKeys = ['apiKey', 'authDomain', 'projectId', 'appId'];
+const isFirebaseConfigured = requiredFirebaseKeys.every((key) => {
+  const value = firebaseConfig[key];
+  return value && !String(value).startsWith('your_');
+});
 
-
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const app = isFirebaseConfigured ? initializeApp(firebaseConfig) : null;
+const auth = app ? getAuth(app) : null;
+const db = app ? getFirestore(app) : null;
+const appId = typeof globalThis.__app_id !== 'undefined' ? globalThis.__app_id : 'default-app-id';
 
 // --- Assets / Constants ---
 const THEME = {
@@ -92,6 +107,174 @@ const DEMO_PUZZLE = {
   truth: "这个男人以前和朋友一起遭遇了海难，漂流到一个荒岛上。在岛上饥寒交迫之际，朋友出去找食物。朋友回来后给他煮了一碗'海鸥肉汤'让他活了下来，但朋友自己却饿死了。后来他获救后，在餐厅点了真正的海鸥肉汤，发现味道和当年完全不同。他意识到当年朋友给他吃的是朋友自己身上的肉，是朋友用自己的生命救了他。他无法承受这个真相，于是选择了自杀。",
   clues_total: 5,
   difficulty: "HARD"
+};
+
+const MAX_QUERY_COUNT = 30;
+const PUZZLE_TYPE_OPTIONS = [
+  {
+    id: 'random',
+    label: '随机',
+    description: '不限定风格',
+    prompt: ''
+  },
+  {
+    id: 'honkaku',
+    label: '本格推理',
+    description: '现实逻辑',
+    preferredGenre: '本格',
+    prompt: '现实世界逻辑、本格推理、身份反转、时间反转、因果反转，禁止超自然元素。'
+  },
+  {
+    id: 'henkaku',
+    label: '变格怪谈',
+    description: '灵异规则',
+    preferredGenre: '变格',
+    prompt: '灵异、怪谈或不可思议设定，但规则必须自洽，谜底要能解释所有异常。'
+  },
+  {
+    id: 'suspense',
+    label: '现实悬疑',
+    description: '犯罪事故',
+    preferredGenre: '本格',
+    prompt: '现实悬疑、犯罪、事故、人性动机或误导性证词，避免依赖超自然解释。'
+  },
+  {
+    id: 'horror',
+    label: '轻恐怖',
+    description: '压迫反转',
+    preferredGenre: '变格',
+    prompt: '轻恐怖、心理压迫、怪谈氛围或诡异日常，避免过度血腥猎奇。'
+  },
+  {
+    id: 'scifi',
+    label: '科幻设定',
+    description: '机制谜题',
+    preferredGenre: '变格',
+    prompt: '科幻机制、AI、克隆、记忆、时间循环、太空或实验设定，核心反转依靠设定规则成立。'
+  },
+  {
+    id: 'nodeath',
+    label: '无死亡',
+    description: '生活反常',
+    preferredGenre: '本格',
+    desiredHasDeath: false,
+    prompt: '不要涉及死亡、自杀或谋杀，用误会、善意谎言、职业规则、生活细节或视角误导制造反转。'
+  }
+];
+const USERNAME_STORAGE_KEY = "turtle-soup.username";
+const LOCAL_UID_STORAGE_KEY = "turtle-soup.localUid";
+const ACCESS_STORAGE_KEY = "turtle-soup.authorized";
+const LAST_ROOM_STORAGE_KEY = "turtle-soup.lastRoom";
+const LAST_ROOM_MODE_STORAGE_KEY = "turtle-soup.lastRoomMode";
+const createRoomId = () => {
+  if (typeof window !== 'undefined' && window.crypto?.getRandomValues) {
+    const buffer = new Uint32Array(1);
+    window.crypto.getRandomValues(buffer);
+    return String((buffer[0] % 9000) + 1000);
+  }
+  return String(Math.floor(1000 + Math.random() * 9000));
+};
+const sanitizeRoomId = (value) => (
+  value
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/[^\w\u4e00-\u9fa5-]/g, '')
+    .slice(0, 24)
+);
+const getInitialRoomId = () => {
+  if (typeof window === 'undefined') return '';
+  const roomFromUrl = sanitizeRoomId(new URLSearchParams(window.location.search).get('room') || '');
+  if (roomFromUrl) return roomFromUrl;
+  return sanitizeRoomId(window.localStorage.getItem(LAST_ROOM_STORAGE_KEY) || '');
+};
+const getSavedUsername = () => {
+  if (typeof window === 'undefined') return '';
+  return window.localStorage.getItem(USERNAME_STORAGE_KEY) || '';
+};
+const getSavedRoomEntryMode = (roomId) => {
+  if (typeof window === 'undefined' || !roomId) return 'create';
+  const savedRoom = window.localStorage.getItem(LAST_ROOM_STORAGE_KEY);
+  const savedMode = window.localStorage.getItem(LAST_ROOM_MODE_STORAGE_KEY);
+  return savedRoom === roomId && (savedMode === 'create' || savedMode === 'join') ? savedMode : 'join';
+};
+const getSavedAuthorization = () => {
+  if (typeof window === 'undefined') return false;
+  return window.localStorage.getItem(ACCESS_STORAGE_KEY) === 'true';
+};
+const getLocalUserId = () => {
+  if (typeof window === 'undefined') return `local-${Math.random().toString(36).slice(2)}`;
+  const saved = window.localStorage.getItem(LOCAL_UID_STORAGE_KEY);
+  if (saved) return saved;
+  const next = `local-${window.crypto?.randomUUID?.() || Math.random().toString(36).slice(2)}`;
+  window.localStorage.setItem(LOCAL_UID_STORAGE_KEY, next);
+  return next;
+};
+const localRoomUrl = (roomId, action = 'state') => `/api/local/rooms/${encodeURIComponent(roomId)}/${action}`;
+const requestLocalRoom = async (roomId, action, body = null, method = 'POST') => {
+  const response = await fetch(localRoomUrl(roomId, action), {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.error?.message || data.message || `Local room request failed (${response.status})`);
+  }
+  return data;
+};
+const toTimestampMs = (value) => {
+  if (!value) return 0;
+  if (typeof value === 'number') return value;
+  if (typeof value.toDate === 'function') return value.toDate().getTime();
+  if (value.seconds) return value.seconds * 1000;
+  return 0;
+};
+const isPlayerActive = (player, currentTime = Date.now()) => {
+  if (!player || player.status === 'OFFLINE') return false;
+  const lastSeenTime = toTimestampMs(player.lastSeen);
+  return !lastSeenTime || (currentTime - lastSeenTime) < 70000;
+};
+const formatTimestampTime = (value) => {
+  const time = toTimestampMs(value);
+  return time ? new Date(time).toLocaleTimeString() : '';
+};
+const sendLocalRoomBeacon = (roomId, action, body) => {
+  if (typeof window === 'undefined' || !window.navigator?.sendBeacon || !roomId) return false;
+  return window.navigator.sendBeacon(
+    localRoomUrl(roomId, action),
+    new Blob([JSON.stringify(body)], { type: 'application/json' })
+  );
+};
+const getRoomAccessPassword = () => import.meta.env.VITE_ACCESS_PASSWORD || "8888";
+const getAIConfigPassword = () => import.meta.env.VITE_AI_CONFIG_PASSWORD || import.meta.env.VITE_ACCESS_PASSWORD || "8888";
+const createAIChannelId = () => (
+  `channel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+);
+const maskAIConfigState = (state) => ({
+  activeChannelId: state.activeChannelId,
+  channels: state.channels.map((channel) => ({
+    ...channel,
+    apiKey: '',
+    hasStoredKey: Boolean(channel.apiKey)
+  }))
+});
+const getActiveAIChannelDraft = (state) => (
+  state.channels.find((channel) => channel.id === state.activeChannelId) || state.channels[0]
+);
+const getPuzzleTypeOption = (typeId) => (
+  PUZZLE_TYPE_OPTIONS.find((option) => option.id === typeId) || PUZZLE_TYPE_OPTIONS[0]
+);
+const buildPuzzleGenerationOptions = (typeId, theme) => {
+  const typeOption = getPuzzleTypeOption(typeId);
+  const cleanTheme = String(theme || '').trim();
+  const themeParts = [typeOption.prompt, cleanTheme].filter(Boolean);
+
+  return {
+    puzzleType: typeOption.id === 'random' ? '' : typeOption.label,
+    preferredGenre: typeOption.preferredGenre || '',
+    desiredHasDeath: typeOption.desiredHasDeath,
+    theme: themeParts.join('；')
+  };
 };
 
 // --- GAME ENGINE INTERFACE ---
@@ -222,8 +405,11 @@ const LogItem = ({ message }) => {
 
 export default function App() {
   const [user, setUser] = useState(null);
-  const [username, setUsername] = useState('');
+  const [username, setUsername] = useState(() => getSavedUsername());
   const [joined, setJoined] = useState(false);
+  const [roomInput, setRoomInput] = useState(() => getInitialRoomId() || createRoomId());
+  const [roomId, setRoomId] = useState(() => getInitialRoomId());
+  const [roomEntryMode, setRoomEntryMode] = useState(() => getSavedRoomEntryMode(getInitialRoomId())); // create | join
 
   // Game State
   const [messages, setMessages] = useState([]);
@@ -233,23 +419,32 @@ export default function App() {
   const [clues, setClues] = useState([]);
   const [players, setPlayers] = useState([]);
   const [systemLogs, setSystemLogs] = useState([]);
-  const [theme, setTheme] = useState('night'); // 'night' | 'day'
-  const [gamePhase, setGamePhase] = useState('PLAYING'); // 'PLAYING' | 'FINISHED'
+  const [theme, setTheme] = useState('day'); // 'night' | 'day'
+  const [gamePhase, setGamePhase] = useState('LOBBY'); // 'LOBBY' | 'STARTING' | 'PLAYING' | 'FINISHED'
   const [solvedBy, setSolvedBy] = useState(null); // 谁解开了谜题
-  const [currentPuzzle, setCurrentPuzzle] = useState(DEMO_PUZZLE); // 当前谜题
+  const [currentPuzzle, setCurrentPuzzle] = useState(null); // 当前谜题
   const [isGenerating, setIsGenerating] = useState(false); // 本地生成状态
+  const [isInitialPuzzleLoading, setIsInitialPuzzleLoading] = useState(false);
   const [generationLock, setGenerationLock] = useState(null); // 全局生成锁 { isGenerating, by, timestamp }
   const [now, setNow] = useState(Date.now());
   const [worldCompleteness, setWorldCompleteness] = useState(0); // 世界观完整度 (0-100)
   const [persona, setPersona] = useState('TERMINAL'); // 'TERMINAL' | 'MESUGAKI'
+  const [roomOwner, setRoomOwner] = useState(null); // { uid, name }
 
   // Custom Theme Modal State
   const [showNewGameModal, setShowNewGameModal] = useState(false);
+  const [selectedPuzzleType, setSelectedPuzzleType] = useState('random');
   const [themeKeywords, setThemeKeywords] = useState('');
+  const [showAIConfigModal, setShowAIConfigModal] = useState(false);
+  const [aiConfigUnlocked, setAIConfigUnlocked] = useState(false);
+  const [aiConfigPasscode, setAIConfigPasscode] = useState('');
+  const [aiConfigDraft, setAIConfigDraft] = useState(() => maskAIConfigState(getAIConfigState()));
+  const [rememberAIKey, setRememberAIKey] = useState(false);
+  const [aiConfigNotice, setAIConfigNotice] = useState('');
 
   // Access Control
   const [passcode, setPasscode] = useState('');
-  const [isAuthorized, setIsAuthorized] = useState(false);
+  const [isAuthorized, setIsAuthorized] = useState(() => getSavedAuthorization());
 
   // 强制刷新 UI (用于检测离线)
   useEffect(() => {
@@ -259,6 +454,15 @@ export default function App() {
 
 
   const isGlobalLoading = useMemo(() => messages.some(m => m.status === 'analyzing'), [messages]);
+  const lockStartedAt = toTimestampMs(generationLock?.timestamp);
+  const isGenerationLocked = Boolean(generationLock?.isGenerating && lockStartedAt && (now - lockStartedAt < 60000));
+  const isAdminUser = Boolean(ADMIN_UID && user?.uid === ADMIN_UID);
+  const activePlayers = useMemo(() => players.filter((p) => isPlayerActive(p, now)), [players, now]);
+  const currentPlayer = useMemo(() => players.find((p) => p.uid === user?.uid), [players, user?.uid]);
+  const isRoomOwner = Boolean(user?.uid && roomOwner?.uid === user.uid);
+  const canManageRoom = isRoomOwner || isAdminUser;
+  const allActivePlayersReady = activePlayers.length > 0 && activePlayers.every((p) => roomOwner?.uid === p.uid || p.ready);
+
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
   }, [theme]);
@@ -268,9 +472,208 @@ export default function App() {
 
   // --- Auth & Setup ---
   const [authError, setAuthError] = useState(null);
+  const roomCollection = (name) => collection(db, 'artifacts', appId, 'rooms', roomId, name);
+  const roomDoc = (collectionName, documentName) => doc(db, 'artifacts', appId, 'rooms', roomId, collectionName, documentName);
+
+  const applyLocalRoomState = (state) => {
+    if (!state) return;
+
+    setRoomOwner(state.owner || null);
+    setPlayers(Object.values(state.players || {}));
+    setMessages(state.messages || []);
+    setClues(state.clues || []);
+    setSystemLogs(state.systemLogs || []);
+    setCurrentPuzzle(state.currentPuzzle || null);
+    setWorldCompleteness(state.gameStatus?.worldCompleteness || 0);
+    setGenerationLock(state.lock || null);
+
+    if (state.gameStatus?.status === 'FINISHED') {
+      setSolvedBy(state.gameStatus.winner || 'Unknown');
+      setGamePhase('FINISHED');
+    } else if (state.gameStatus?.status === 'PLAYING') {
+      setSolvedBy(null);
+      setGamePhase('PLAYING');
+    } else if (state.gameStatus?.status === 'STARTING') {
+      setSolvedBy(null);
+      setGamePhase('STARTING');
+    } else {
+      setSolvedBy(null);
+      setGamePhase('LOBBY');
+    }
+
+    setTimeout(() => {
+      if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }, 100);
+  };
+
+  const resetRoomState = () => {
+    setJoined(false);
+    setMessages([]);
+    setInputMode('QUERY');
+    setInputText('');
+    setActiveTab('TERMINAL');
+    setClues([]);
+    setPlayers([]);
+    setSystemLogs([]);
+    setGamePhase('LOBBY');
+    setSolvedBy(null);
+    setCurrentPuzzle(null);
+    setIsGenerating(false);
+    setIsInitialPuzzleLoading(false);
+    setGenerationLock(null);
+    setRoomOwner(null);
+    setWorldCompleteness(0);
+    setShowNewGameModal(false);
+    setThemeKeywords('');
+  };
+
+  const enterRoom = (mode, roomValue = roomInput) => {
+    const nextRoomId = sanitizeRoomId(roomValue) || createRoomId();
+    resetRoomState();
+    setJoined(false);
+    setRoomEntryMode(mode);
+    setRoomInput(nextRoomId);
+    setRoomId(nextRoomId);
+    if (typeof window !== 'undefined') {
+      const nextUrl = new URL(window.location.href);
+      nextUrl.searchParams.set('room', nextRoomId);
+      window.history.replaceState(null, '', nextUrl);
+    }
+  };
+
+  const handleCreateRoom = () => {
+    const nextRoomId = sanitizeRoomId(roomInput) || createRoomId();
+    setRoomInput(nextRoomId);
+    enterRoom('create', nextRoomId);
+  };
+
+  const handleEnterRoom = () => {
+    enterRoom('join');
+  };
+
+  const handleLeaveRoom = async () => {
+    if (joined && roomId && user?.uid) {
+      if (!db) {
+        try {
+          await requestLocalRoom(roomId, 'leave', {
+            uid: user.uid,
+            name: username || '玩家'
+          });
+        } catch (error) {
+          console.error("Local leave failed:", error);
+        }
+      } else {
+        try {
+          await updateDoc(roomDoc('players', user.uid), {
+            status: 'OFFLINE',
+            ready: roomOwner?.uid === user.uid,
+            lastSeen: serverTimestamp()
+          });
+        } catch (error) {
+          console.error("Leave failed:", error);
+        }
+      }
+    }
+
+    resetRoomState();
+    setJoined(false);
+    setRoomId('');
+    setRoomEntryMode('create');
+    setRoomInput(createRoomId());
+    if (typeof window !== 'undefined') {
+      window.localStorage.removeItem(LAST_ROOM_STORAGE_KEY);
+      window.localStorage.removeItem(LAST_ROOM_MODE_STORAGE_KEY);
+      const nextUrl = new URL(window.location.href);
+      nextUrl.searchParams.delete('room');
+      window.history.replaceState(null, '', nextUrl);
+    }
+  };
+
+  const openAIConfig = () => {
+    setAIConfigDraft(maskAIConfigState(getAIConfigState()));
+    setRememberAIKey(false);
+    setAIConfigPasscode('');
+    setAIConfigNotice('');
+    setAIConfigUnlocked(false);
+    setShowAIConfigModal(true);
+  };
+
+  const unlockAIConfig = (e) => {
+    e.preventDefault();
+    const validPass = getAIConfigPassword();
+    if (aiConfigPasscode === validPass) {
+      setAIConfigUnlocked(true);
+      setAIConfigPasscode('');
+      setAIConfigNotice('');
+    } else {
+      setAIConfigNotice('密码错误，无法进入 AI 配置。');
+      setAIConfigPasscode('');
+    }
+  };
+
+  const handleSaveAIConfig = (e) => {
+    e.preventDefault();
+    saveAIConfigState(aiConfigDraft, { persistKey: rememberAIKey });
+    setAIConfigDraft(maskAIConfigState(getAIConfigState()));
+    setAIConfigNotice(rememberAIKey ? '已保存所有渠道，Key 已写入本机浏览器。' : '已保存所有渠道，Key 仅保存在本次会话。');
+  };
+
+  const handleResetAIConfig = () => {
+    resetAIConfig();
+    setAIConfigDraft(maskAIConfigState(getAIConfigState()));
+    setRememberAIKey(false);
+    setAIConfigNotice('已恢复为配置文件默认渠道。');
+  };
+
+  const handleAddAIChannel = () => {
+    setAIConfigDraft((prev) => {
+      const baseConfig = getAIConfig();
+      const nextChannel = {
+        id: createAIChannelId(),
+        name: `渠道 ${prev.channels.length + 1}`,
+        apiUrl: baseConfig.apiUrl || '/api/chat/completions',
+        model: baseConfig.model || '',
+        apiKey: '',
+        hasStoredKey: false
+      };
+      return {
+        activeChannelId: nextChannel.id,
+        channels: [...prev.channels, nextChannel]
+      };
+    });
+    setAIConfigNotice('');
+  };
+
+  const handleRemoveAIChannel = () => {
+    setAIConfigDraft((prev) => {
+      if (prev.channels.length <= 1) return prev;
+      const nextChannels = prev.channels.filter((channel) => channel.id !== prev.activeChannelId);
+      return {
+        activeChannelId: nextChannels[0]?.id || prev.activeChannelId,
+        channels: nextChannels
+      };
+    });
+    setAIConfigNotice('');
+  };
+
+  const updateActiveAIChannel = (updates) => {
+    setAIConfigDraft((prev) => ({
+      ...prev,
+      channels: prev.channels.map((channel) => (
+        channel.id === prev.activeChannelId ? { ...channel, ...updates } : channel
+      ))
+    }));
+    setAIConfigNotice('');
+  };
 
   // --- Auth & Setup ---
   useEffect(() => {
+    if (!auth) {
+      setUser({ uid: getLocalUserId(), isAnonymous: true, local: true });
+      setAuthError(null);
+      return;
+    }
+
     const initAuth = async () => {
       try {
         await signInAnonymously(auth);
@@ -292,11 +695,11 @@ export default function App() {
 
   // --- Data Sync ---
   useEffect(() => {
-    if (!user || !joined) return;
+    if (!user || !joined || !roomId || !db) return;
 
     // 1. Sync Messages
     const msgQuery = query(
-      collection(db, 'artifacts', appId, 'public', 'data', 'chat_messages'),
+      roomCollection('chat_messages'),
       orderBy('timestamp', 'asc'),
       limit(50)
     );
@@ -311,27 +714,29 @@ export default function App() {
     }, (err) => console.error("Chat sync error", err));
 
     // 2. Sync Clues (Mocking shared state)
-    const cluesQuery = query(collection(db, 'artifacts', appId, 'public', 'data', 'game_clues'));
+    const cluesQuery = query(roomCollection('game_clues'));
     const unsubClues = onSnapshot(cluesQuery, (snapshot) => {
       setClues(snapshot.docs.map(doc => doc.data()));
     }, (err) => console.error("Clues sync error", err));
 
     // 3. Sync Players
-    const playersQuery = query(collection(db, 'artifacts', appId, 'public', 'data', 'players'));
+    const playersQuery = query(roomCollection('players'));
     const unsubPlayers = onSnapshot(playersQuery, (snapshot) => {
       setPlayers(snapshot.docs.map(doc => doc.data()));
     }, (err) => console.error("Players sync error", err));
 
     // 4. Sync Puzzle
-    const puzzleRef = doc(db, 'artifacts', appId, 'public', 'data', 'room_state', 'current_puzzle');
+    const puzzleRef = roomDoc('room_state', 'current_puzzle');
     const unsubPuzzle = onSnapshot(puzzleRef, (docSnap) => {
       if (docSnap.exists()) {
         setCurrentPuzzle(docSnap.data());
+      } else {
+        setCurrentPuzzle(null);
       }
     }, (err) => console.error("Puzzle sync error", err));
 
     // 5. Sync Game Status (Completeness)
-    const statusRef = doc(db, 'artifacts', appId, 'public', 'data', 'room_state', 'game_status');
+    const statusRef = roomDoc('room_state', 'game_status');
     const unsubStatus = onSnapshot(statusRef, (docSnap) => {
       if (docSnap.exists()) {
         const data = docSnap.data();
@@ -346,24 +751,38 @@ export default function App() {
               setGamePhase('FINISHED');
             }, 3000);
           }
-        } else {
-          // Server authority: If not FINISHED, must be PLAYING
+        } else if (data.status === 'PLAYING') {
+          setSolvedBy(null);
           setGamePhase('PLAYING');
+        } else if (data.status === 'STARTING') {
+          setSolvedBy(null);
+          setGamePhase('STARTING');
+        } else {
+          setSolvedBy(null);
+          setGamePhase('LOBBY');
         }
+      } else {
+        setGamePhase('LOBBY');
       }
     });
 
     // 6. Sync Generation Lock
-    const lockRef = doc(db, 'artifacts', appId, 'public', 'data', 'room_state', 'lock');
+    const lockRef = roomDoc('room_state', 'lock');
     const unsubLock = onSnapshot(lockRef, (docSnap) => {
       if (docSnap.exists()) {
         setGenerationLock(docSnap.data());
       }
     });
 
-    // 7. Sync System Logs
+    // 7. Sync Room Owner
+    const ownerRef = roomDoc('room_meta', 'owner');
+    const unsubOwner = onSnapshot(ownerRef, (docSnap) => {
+      setRoomOwner(docSnap.exists() ? docSnap.data() : null);
+    }, (err) => console.error("Owner sync error", err));
+
+    // 8. Sync System Logs
     const logsQuery = query(
-      collection(db, 'artifacts', appId, 'public', 'data', 'system_logs'),
+      roomCollection('system_logs'),
       orderBy('timestamp', 'desc'),
       limit(20)
     );
@@ -371,7 +790,7 @@ export default function App() {
       const logs = snapshot.docs.map(doc => {
         const data = doc.data();
         // Format timestamp locally
-        const time = data.timestamp ? data.timestamp.toDate().toLocaleTimeString() : '...';
+        const time = formatTimestampTime(data.timestamp) || '...';
         return `[${time}] ${data.message}`;
       });
       setSystemLogs(logs);
@@ -384,17 +803,92 @@ export default function App() {
       unsubPuzzle();
       unsubStatus();
       unsubLock();
+      unsubOwner();
       unsubLogs();
     };
-  }, [user, joined]);
+  }, [user, joined, roomId]);
+
+  // --- Local Room Sync (when Firebase is not configured) ---
+  useEffect(() => {
+    if (!user || !joined || !roomId || db) return;
+
+    const events = new EventSource(localRoomUrl(roomId, 'events'));
+    events.onmessage = (event) => {
+      try {
+        applyLocalRoomState(JSON.parse(event.data));
+      } catch (error) {
+        console.error("Local room sync parse error", error);
+      }
+    };
+    events.onerror = (error) => {
+      console.error("Local room sync error", error);
+    };
+
+    return () => events.close();
+  }, [user, joined, roomId]);
 
   // --- Heartbeat Logic ---
   useEffect(() => {
-    if (!user || !joined) return;
+    if (!user || !joined || !roomId || db) return;
+
+    const sendHeartbeat = () => {
+      requestLocalRoom(roomId, 'heartbeat', {
+        uid: user.uid,
+        name: username || 'Unknown'
+      }).catch((err) => console.error("Local heartbeat error:", err));
+    };
+
+    sendHeartbeat();
+    const heartbeatInterval = setInterval(sendHeartbeat, 30000);
+    return () => clearInterval(heartbeatInterval);
+  }, [user, joined, roomId, username]);
+
+  useEffect(() => {
+    if (!user || !joined || !roomId) return;
+
+    const markLocalOffline = (event) => {
+      if (event?.persisted) return;
+      if (!db) {
+        sendLocalRoomBeacon(roomId, 'leave', {
+          uid: user.uid,
+          name: username || '玩家',
+          transient: true
+        });
+      }
+    };
+
+    const markLocalOnline = () => {
+      if (!db) {
+        requestLocalRoom(roomId, 'heartbeat', {
+          uid: user.uid,
+          name: username || '玩家'
+        }).catch((err) => console.error("Local resume heartbeat error:", err));
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        markLocalOnline();
+      }
+    };
+
+    window.addEventListener('pagehide', markLocalOffline);
+    window.addEventListener('pageshow', markLocalOnline);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      window.removeEventListener('pagehide', markLocalOffline);
+      window.removeEventListener('pageshow', markLocalOnline);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [user, joined, roomId, username]);
+
+  useEffect(() => {
+    if (!user || !joined || !roomId || !db) return;
+    const userRef = roomDoc('players', user.uid);
 
     const heartbeatInterval = setInterval(async () => {
       try {
-        const userRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', user.uid);
         // 只更新 lastSeen，不更新其它字段
         await updateDoc(userRef, { lastSeen: serverTimestamp() });
       } catch (err) {
@@ -407,7 +901,8 @@ export default function App() {
               score: 0,
               uid: user.uid,
               status: 'ONLINE',
-              queryCount: 10,
+              ready: roomOwner?.uid === user.uid,
+              queryCount: MAX_QUERY_COUNT,
               lastQueryTime: null,
               lastSeen: serverTimestamp(),
               joinedAt: serverTimestamp()
@@ -421,14 +916,88 @@ export default function App() {
     }, 30000); // 30s interval
 
     return () => clearInterval(heartbeatInterval);
-  }, [user, joined]);
+  }, [user, joined, roomId, username, roomOwner?.uid]);
 
   // --- Actions ---
 
   const handleJoin = async () => {
     if (!username.trim()) return;
+    const cleanUsername = username.trim();
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem(USERNAME_STORAGE_KEY, cleanUsername);
+    }
+    const activeRoomId = roomId || sanitizeRoomId(roomInput) || createRoomId();
+    setRoomId(activeRoomId);
+    if (typeof window !== 'undefined') {
+      const nextUrl = new URL(window.location.href);
+      nextUrl.searchParams.set('room', activeRoomId);
+      window.history.replaceState(null, '', nextUrl);
+    }
+    if (!db) {
+      try {
+        const { owner, state } = await requestLocalRoom(activeRoomId, 'join', {
+          uid: user.uid,
+          name: cleanUsername,
+          createRoom: roomEntryMode === 'create'
+        });
+        setAuthError(null);
+        applyLocalRoomState(state);
+        setJoined(true);
+        setRoomOwner(owner || state?.owner || null);
+        if (typeof window !== 'undefined') {
+          window.localStorage.setItem(LAST_ROOM_STORAGE_KEY, activeRoomId);
+          window.localStorage.setItem(LAST_ROOM_MODE_STORAGE_KEY, roomEntryMode);
+        }
+      } catch (error) {
+        console.error("Local join failed:", error);
+        setAuthError(error.message || '加入房间失败。');
+      }
+      return;
+    }
+
+    let ownerInfo;
+    try {
+      const ownerRef = roomDoc('room_meta', 'owner');
+      ownerInfo = await runTransaction(db, async (transaction) => {
+        const ownerSnap = await transaction.get(ownerRef);
+
+        if (roomEntryMode !== 'create' && !ownerSnap.exists()) {
+          throw new Error('房间不存在，请确认房间号，或先创建房间。');
+        }
+
+        if (roomEntryMode === 'create') {
+          if (ownerSnap.exists()) {
+            const existingOwner = ownerSnap.data();
+            if (existingOwner.uid !== user.uid) {
+              throw new Error('这个房间号已经存在，请换一个房间号。');
+            }
+            return { uid: existingOwner.uid, name: existingOwner.name };
+          }
+
+          const newOwner = {
+            uid: user.uid,
+            name: cleanUsername,
+            claimedAt: serverTimestamp()
+          };
+          transaction.set(ownerRef, newOwner);
+          transaction.set(roomDoc('room_state', 'game_status'), {
+            status: 'LOBBY',
+            worldCompleteness: 0,
+            winner: null,
+            lastUpdate: serverTimestamp()
+          });
+          return { uid: newOwner.uid, name: newOwner.name };
+        }
+
+        return ownerSnap.data();
+      });
+    } catch (error) {
+      setAuthError(error.message || '加入房间失败。');
+      return;
+    }
+
     // Check Username Uniqueness
-    const playersRef = collection(db, 'artifacts', appId, 'public', 'data', 'players');
+    const playersRef = roomCollection('players');
     const q = query(playersRef); // Get all players to check uniqueness (client-side filter for simplicity or use where clause if indexed)
     // Since we need to check active players, checking all is safer if we don't have good offline detection index
 
@@ -439,32 +1008,174 @@ export default function App() {
     const isTaken = snapshot.docs.some(d => {
       const p = d.data();
       // Check if name matches AND player is considered online (e.g. within last 2 mins)
-      const lastSeenMs = p.lastSeen?.seconds ? p.lastSeen.seconds * 1000 : 0;
+      const lastSeenMs = toTimestampMs(p.lastSeen);
       const isOnline = (Date.now() - lastSeenMs) < 120000;
-      return p.name.toLowerCase() === username.trim().toLowerCase() && isOnline && p.uid !== user.uid;
+      return p.name.toLowerCase() === cleanUsername.toLowerCase() && isOnline && p.uid !== user.uid;
     });
 
     if (isTaken) {
-      setAuthError(`Identity '${username}' is currently active. Choose another codename.`);
+      setAuthError(`昵称「${cleanUsername}」已经在这个房间里，请换一个昵称。`);
       return;
     }
 
-    setJoined(true);
+    setRoomOwner(ownerInfo);
 
     // Register player
-    const playerRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', user.uid);
+    const playerRef = roomDoc('players', user.uid);
     await setDoc(playerRef, {
-      name: username,
+      name: cleanUsername,
       score: 0,
       uid: user.uid,
+      role: ownerInfo.uid === user.uid ? 'owner' : 'player',
       status: 'ONLINE',
-      queryCount: 10,
+      ready: ownerInfo.uid === user.uid,
+      queryCount: MAX_QUERY_COUNT,
       lastQueryTime: null,
       lastSeen: serverTimestamp(),
       joinedAt: serverTimestamp()
     });
 
-    addSystemLog(`${username} initialized connection.`);
+    setJoined(true);
+    setGamePhase('LOBBY');
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem(LAST_ROOM_STORAGE_KEY, activeRoomId);
+      window.localStorage.setItem(LAST_ROOM_MODE_STORAGE_KEY, roomEntryMode);
+    }
+    addSystemLog(ownerInfo.uid === user.uid ? `${cleanUsername} 创建房间，等待玩家准备。` : `${cleanUsername} 加入准备大厅。`);
+  };
+
+  const handleToggleReady = async () => {
+    if (!user || gamePhase !== 'LOBBY') return;
+    if (isRoomOwner) return;
+    const nextReady = !currentPlayer?.ready;
+
+    if (!db) {
+      try {
+        const result = await requestLocalRoom(roomId, 'ready', {
+          uid: user.uid,
+          ready: nextReady
+        });
+        applyLocalRoomState(result.state);
+      } catch (error) {
+        addSystemLog(`READY ERROR: ${error.message}`);
+      }
+      return;
+    }
+
+    try {
+      await updateDoc(roomDoc('players', user.uid), {
+        ready: nextReady,
+        lastSeen: serverTimestamp()
+      });
+      addSystemLog(`${username} ${nextReady ? '已准备' : '取消准备'}。`);
+    } catch (error) {
+      addSystemLog(`READY ERROR: ${error.message}`);
+    }
+  };
+
+  const handleStartGame = async (options = {}) => {
+    if (!canManageRoom || gamePhase !== 'LOBBY') return;
+
+    if (!allActivePlayersReady) {
+      addSystemLog('还有玩家未准备。');
+      return;
+    }
+
+    if (!db) {
+      try {
+        const startResult = await requestLocalRoom(roomId, 'start', {
+          uid: user.uid,
+          name: username
+        });
+        applyLocalRoomState(startResult.state);
+        await handleGeneratePuzzle(options, {
+          initialGeneration: true,
+          skipPermissionCheck: true,
+          targetRoomId: roomId
+        });
+      } catch (error) {
+        addSystemLog(`START ERROR: ${error.message}`);
+      }
+      return;
+    }
+
+    try {
+      await setDoc(roomDoc('room_state', 'game_status'), {
+        status: 'STARTING',
+        worldCompleteness: 0,
+        winner: null,
+        lastUpdate: serverTimestamp()
+      }, { merge: true });
+      addSystemLog(`${username} 开始游戏，AI 正在准备谜题。`);
+      await handleGeneratePuzzle(options, {
+        initialGeneration: true,
+        skipPermissionCheck: true
+      });
+    } catch (error) {
+      addSystemLog(`START ERROR: ${error.message}`);
+    }
+  };
+
+  const handleResetToLobby = async () => {
+    if (!canManageRoom) return;
+
+    if (!db) {
+      try {
+        const result = await requestLocalRoom(roomId, 'reset-lobby', {
+          uid: user.uid,
+          name: username
+        });
+        applyLocalRoomState(result.state);
+      } catch (error) {
+        addSystemLog(`LOBBY ERROR: ${error.message}`);
+      }
+      return;
+    }
+
+    try {
+      const messagesSnapshot = await getDocs(roomCollection('chat_messages'));
+      await Promise.all(messagesSnapshot.docs.map((messageDoc) => deleteDoc(messageDoc.ref)));
+
+      const cluesSnapshot = await getDocs(roomCollection('game_clues'));
+      await Promise.all(cluesSnapshot.docs.map((clueDoc) => deleteDoc(clueDoc.ref)));
+
+      const playersSnapshot = await getDocs(roomCollection('players'));
+      await Promise.all(playersSnapshot.docs.map((playerDoc) => {
+        const playerData = playerDoc.data();
+        return updateDoc(playerDoc.ref, {
+          score: 0,
+          ready: roomOwner?.uid === playerData.uid,
+          queryCount: MAX_QUERY_COUNT,
+          lastQueryTime: null
+        });
+      }));
+
+      const puzzleSnap = await getDoc(roomDoc('room_state', 'current_puzzle'));
+      if (puzzleSnap.exists()) await deleteDoc(roomDoc('room_state', 'current_puzzle'));
+
+      await setDoc(roomDoc('room_state', 'game_status'), {
+        status: 'LOBBY',
+        worldCompleteness: 0,
+        winner: null,
+        lastUpdate: serverTimestamp()
+      }, { merge: true });
+
+      addSystemLog(`${username} 开启新一轮准备。`);
+    } catch (error) {
+      addSystemLog(`LOBBY ERROR: ${error.message}`);
+    }
+  };
+
+  const copyRoomLink = async () => {
+    if (typeof window === 'undefined') return;
+    const inviteUrl = new URL(window.location.href);
+    inviteUrl.searchParams.set('room', roomId);
+    try {
+      await window.navigator.clipboard.writeText(inviteUrl.toString());
+      addSystemLog('房间链接已复制。');
+    } catch {
+      addSystemLog(`房间号：${roomId}`);
+    }
   };
 
   const handleSendMessage = async (e) => {
@@ -475,10 +1186,28 @@ export default function App() {
     if (inputText.trim().toLowerCase() === '/skip') {
       setInputText('');
 
-      if (ADMIN_UID && user.uid !== ADMIN_UID) {
-        addSystemLog(`ACCESS DENIED: /skip requires ADMIN privileges.`);
-        await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'chat_messages'), {
-          text: `> COMMAND REJECTED: UNAUTHORIZED USER [${username}]`,
+      if (!db) {
+        if (!canManageRoom) {
+          addSystemLog(`ACCESS DENIED: /skip 只有房主可以使用。`);
+          return;
+        }
+
+        try {
+          const result = await requestLocalRoom(roomId, 'skip', {
+            uid: user.uid,
+            name: username
+          });
+          applyLocalRoomState(result.state);
+        } catch (error) {
+          addSystemLog(`ACCESS DENIED: ${error.message}`);
+        }
+        return;
+      }
+
+      if (!canManageRoom) {
+        addSystemLog(`ACCESS DENIED: /skip 只有房主可以使用。`);
+        await addDoc(roomCollection('chat_messages'), {
+          text: `> 指令被拒绝：只有房主可以跳过当前谜题。`,
           sender: "SYSTEM",
           senderId: "SYSTEM",
           type: "error",
@@ -489,7 +1218,7 @@ export default function App() {
       }
 
       // Sync Finish State
-      const statusRef = doc(db, 'artifacts', appId, 'public', 'data', 'room_state', 'game_status');
+      const statusRef = roomDoc('room_state', 'game_status');
       await setDoc(statusRef, {
         status: 'FINISHED',
         winner: `${username} (SKIPPED)`,
@@ -502,7 +1231,7 @@ export default function App() {
       addSystemLog(`${username} EXECUTED /skip. TRUTH REVEALED.`);
 
       // Override Message
-      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'chat_messages'), {
+      await addDoc(roomCollection('chat_messages'), {
         text: ">> [OVERRIDE] FORCE SKIP DETECTED. REVEALING TRUTH...",
         sender: "SYSTEM",
         senderId: "SYSTEM",
@@ -514,9 +1243,9 @@ export default function App() {
     }
 
     // --- Sanity & Cooldown Check ---
-    const currentPlayer = players.find(p => p.uid === user.uid);
     const now = Date.now();
-    const lastQueryTime = currentPlayer?.lastQueryTime?.toDate().getTime() || 0;
+    const rawLastQuery = currentPlayer?.lastQueryTime;
+    const lastQueryTime = toTimestampMs(rawLastQuery);
 
     // Check Cooldown (30s) - Only strictly enforced for QUERY success, but checked here for UI
     if (now - lastQueryTime < 10000) {
@@ -525,7 +1254,7 @@ export default function App() {
     }
 
     // Check Sanity
-    if (inputMode === 'QUERY' && (currentPlayer?.queryCount ?? 10) <= 0) {
+    if (inputMode === 'QUERY' && (currentPlayer?.queryCount ?? MAX_QUERY_COUNT) <= 0) {
       addSystemLog('SANITY DEPLETED. CANNOT QUERY.');
       return;
     }
@@ -534,8 +1263,62 @@ export default function App() {
     const mode = inputMode;
     setInputText('');
 
+    if (!db) {
+      const localUserMsg = {
+        id: `local-user-${Date.now()}`,
+        text,
+        sender: username,
+        senderId: user.uid,
+        type: mode === 'SOLVE' ? 'attempt' : 'question',
+        status: 'processed'
+      };
+
+      try {
+        const messageResult = await requestLocalRoom(roomId, 'user-message', {
+          message: localUserMsg
+        });
+        applyLocalRoomState(messageResult.state);
+
+        const recentHistory = messages
+          .filter(m => m.status !== 'analyzing' && m.status !== 'error')
+          .slice(-20)
+          .map(m => ({ role: m.senderId === 'AI' ? 'assistant' : 'user', content: m.text }));
+
+        const currentClueTexts = clues.map(c => c.text);
+        const aiResponse = await callGameEngine(text, mode, recentHistory, currentPuzzle, currentClueTexts, worldCompleteness, persona);
+        let scoreDelta = aiResponse.score_delta || 0;
+
+        if (mode === 'SOLVE' && aiResponse.is_correct) {
+          const bonusMultiplier = 2 - ((worldCompleteness || 0) / 100);
+          scoreDelta = Math.ceil(scoreDelta * bonusMultiplier);
+        }
+
+        const result = await requestLocalRoom(roomId, 'ai-response', {
+          userUid: user.uid,
+          username,
+          mode,
+          response: aiResponse,
+          scoreDelta
+        });
+        applyLocalRoomState(result.state);
+      } catch (error) {
+        console.error("Game engine error:", error);
+        try {
+          const result = await requestLocalRoom(roomId, 'message-error', {
+            messageId: localUserMsg.id,
+            error: error.message
+          });
+          applyLocalRoomState(result.state);
+        } catch (fallbackError) {
+          console.error("Local message error sync failed:", fallbackError);
+          addSystemLog(`TRANSMISSION ERROR: ${error.message}`);
+        }
+      }
+      return;
+    }
+
     // 1. 立即显示用户的输入 (Optimistic UI) - Set status: 'analyzing'
-    const userMsgRef = await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'chat_messages'), {
+    const userMsgRef = await addDoc(roomCollection('chat_messages'), {
       text,
       sender: username,
       senderId: user.uid,
@@ -560,7 +1343,7 @@ export default function App() {
       // 4. 更新世界观完整度
       const newCompleteness = aiResponse.completeness_percent || worldCompleteness;
       if (newCompleteness !== worldCompleteness) {
-        await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'room_state', 'game_status'), {
+        await setDoc(roomDoc('room_state', 'game_status'), {
           worldCompleteness: newCompleteness,
           lastUpdate: serverTimestamp()
         }, { merge: true });
@@ -576,7 +1359,7 @@ export default function App() {
       }
 
       // 更新玩家状态
-      const playerRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', user.uid);
+      const playerRef = roomDoc('players', user.uid);
       const updates = {};
 
       if (scoreDelta > 0) updates.score = increment(scoreDelta);
@@ -597,7 +1380,7 @@ export default function App() {
 
       // 5. 如果解锁了新线索，添加到 Evidence
       if (aiResponse.new_clue) {
-        await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'game_clues'), {
+        await addDoc(roomCollection('game_clues'), {
           text: aiResponse.new_clue,
           unlockedBy: username
         });
@@ -605,7 +1388,7 @@ export default function App() {
       }
 
       // 6. 显示 AI 回复
-      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'chat_messages'), {
+      await addDoc(roomCollection('chat_messages'), {
         text: aiResponse.text,
         sender: "CORE_AI",
         senderId: "AI",
@@ -629,10 +1412,28 @@ export default function App() {
   };
 
   const addSystemLog = async (msg) => {
+    if (!db) {
+      if (!roomId) {
+        const time = new Date().toLocaleTimeString();
+        setSystemLogs((prev) => [`[${time}] ${msg}`, ...prev].slice(0, 20));
+        return;
+      }
+
+      try {
+        const result = await requestLocalRoom(roomId, 'log', { message: msg });
+        applyLocalRoomState(result.state);
+      } catch (error) {
+        console.error("Failed to add local system log", error);
+        const time = new Date().toLocaleTimeString();
+        setSystemLogs((prev) => [`[${time}] ${msg}`, ...prev].slice(0, 20));
+      }
+      return;
+    }
+
     // Fire and forget
     try {
       // Keep it simple, just add to collection
-      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'system_logs'), {
+      await addDoc(roomCollection('system_logs'), {
         message: msg,
         timestamp: serverTimestamp()
       });
@@ -641,80 +1442,84 @@ export default function App() {
     }
   };
 
-  // 开始新游戏
-  const handleNewGame = async () => {
-    // 清空数据
-    try {
-      const messagesRef = collection(db, 'artifacts', appId, 'public', 'data', 'chat_messages');
-      const messagesSnapshot = await getDocs(messagesRef);
-      await Promise.all(messagesSnapshot.docs.map(doc => deleteDoc(doc.ref)));
-
-      const cluesSnapshot = await getDocs(cluesRef);
-      await Promise.all(cluesSnapshot.docs.map(doc => deleteDoc(doc.ref)));
-
-      const logsRef = collection(db, 'artifacts', appId, 'public', 'data', 'system_logs');
-      const logsSnapshot = await getDocs(logsRef);
-      await Promise.all(logsSnapshot.docs.map(doc => deleteDoc(doc.ref)));
-
-      // 重置所有玩家分数
-      // 重置所有玩家分数
-      const playersRef = collection(db, 'artifacts', appId, 'public', 'data', 'players');
-      const playersSnapshot = await getDocs(playersRef);
-      await Promise.all(playersSnapshot.docs.map(doc =>
-        updateDoc(doc.ref, {
-          score: 0,
-          queryCount: 10,
-          lastQueryTime: null
-        })
-      ));
-    } catch (error) {
-      console.error('Error resetting game:', error);
-    }
-
-    // Reset Game Status (Server)
-    try {
-      await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'room_state', 'game_status'), {
-        worldCompleteness: 0,
-        lastUpdate: serverTimestamp()
-      });
-    } catch (err) {
-      console.error("Error resetting game status:", err);
-    }
-
-    // 重置本地状态
-    setSolvedBy(null);
-    setGamePhase('PLAYING');
-    setInputMode('QUERY');
-    setSystemLogs([]);
-    addSystemLog('NEW GAME INITIALIZED. GOOD LUCK.');
-  };
-
   // 生成新谜题
-  const handleGeneratePuzzle = async (options = {}) => {
+  const handleGeneratePuzzle = async (options = {}, context = {}) => {
+    const { skipPermissionCheck = false, initialGeneration = false, targetRoomId = roomId } = context;
+
+    if (!skipPermissionCheck && !canManageRoom) {
+      addSystemLog('只有房主可以生成新谜题。');
+      return;
+    }
+
+    if (!db) {
+      if (initialGeneration) setIsInitialPuzzleLoading(true);
+      setIsGenerating(true);
+      try {
+        const lockResult = await requestLocalRoom(targetRoomId, 'lock-start', {
+          uid: user.uid,
+          name: username || '房主'
+        });
+        applyLocalRoomState(lockResult.state);
+
+        if (!lockResult.acquired) {
+          addSystemLog(`GENERATION LOCKED BY ${lockResult.state?.lock?.by || 'ANOTHER PLAYER'}`);
+          return;
+        }
+
+        const puzzle = await generatePuzzle(options);
+        const newPuzzle = {
+          title: puzzle.title,
+          content: puzzle.soup_surface,
+          truth: puzzle.soup_base,
+          tags: puzzle.tags,
+          difficulty: puzzle.tags.difficulty
+        };
+        const result = await requestLocalRoom(targetRoomId, 'puzzle', {
+          puzzle: newPuzzle,
+          username,
+          tags: puzzle.tags
+        });
+        applyLocalRoomState(result.state);
+      } catch (error) {
+        console.error('Error generating puzzle:', error);
+        try {
+          const result = await requestLocalRoom(targetRoomId, 'puzzle', {
+            puzzle: DEMO_PUZZLE,
+            username,
+            error: error.message
+          });
+          applyLocalRoomState(result.state);
+        } catch (fallbackError) {
+          console.error('Error applying fallback puzzle:', fallbackError);
+          setCurrentPuzzle(DEMO_PUZZLE);
+          addSystemLog(`ERROR: ${error.message}`);
+        }
+      } finally {
+        setIsGenerating(false);
+        if (initialGeneration) setIsInitialPuzzleLoading(false);
+        requestLocalRoom(targetRoomId, 'lock-finish', { uid: user.uid })
+          .catch((err) => console.error("Error releasing local generation lock", err));
+      }
+      return;
+    }
+
     // Check Global Lock
     const now = Date.now();
     const isLocked = generationLock?.isGenerating &&
-      generationLock.timestamp?.toMillis &&
-      (now - generationLock.timestamp.toMillis() < 60000);
+      toTimestampMs(generationLock.timestamp) &&
+      (now - toTimestampMs(generationLock.timestamp) < 60000);
 
     if (isGenerating || isLocked) {
       if (isLocked) addSystemLog(`GENERATION LOCKED BY ${generationLock.by || 'ANOTHER AGENT'}`);
       return;
     }
 
-    // Admin Check for PLAYING phase
-    if (gamePhase === 'PLAYING') {
-      if (ADMIN_UID && user.uid !== ADMIN_UID) {
-        addSystemLog(`ACCESS DENIED: Only ADMIN can generate new puzzle during active game.`);
-        return;
-      }
-    }
-
+    if (initialGeneration) setIsInitialPuzzleLoading(true);
     setIsGenerating(true);
     addSystemLog('GENERATING NEW PUZZLE...');
 
     // Acquire Lock
-    const lockRef = doc(db, 'artifacts', appId, 'public', 'data', 'room_state', 'lock');
+    const lockRef = roomDoc('room_state', 'lock');
     await setDoc(lockRef, {
       isGenerating: true,
       by: username,
@@ -723,27 +1528,29 @@ export default function App() {
 
     try {
       // 1. Clear Data Immediately
-      const messagesRef = collection(db, 'artifacts', appId, 'public', 'data', 'chat_messages');
+      const messagesRef = roomCollection('chat_messages');
       const messagesSnapshot = await getDocs(messagesRef);
       await Promise.all(messagesSnapshot.docs.map(doc => deleteDoc(doc.ref)));
 
-      const cluesRef = collection(db, 'artifacts', appId, 'public', 'data', 'game_clues');
+      const cluesRef = roomCollection('game_clues');
       const cluesSnapshot = await getDocs(cluesRef);
       await Promise.all(cluesSnapshot.docs.map(doc => deleteDoc(doc.ref)));
 
       // 重置所有玩家分数 (Safe Reset)
-      const playersRef = collection(db, 'artifacts', appId, 'public', 'data', 'players');
+      const playersRef = roomCollection('players');
       const playersSnapshot = await getDocs(playersRef);
-      await Promise.all(playersSnapshot.docs.map(doc =>
-        updateDoc(doc.ref, {
+      await Promise.all(playersSnapshot.docs.map(playerDoc => {
+        const playerData = playerDoc.data();
+        return updateDoc(playerDoc.ref, {
           score: 0,
-          queryCount: 10,
+          ready: roomOwner?.uid === playerData.uid,
+          queryCount: MAX_QUERY_COUNT,
           lastQueryTime: null
-        })
-      ));
+        });
+      }));
 
       // Reset Game Status
-      await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'room_state', 'game_status'), {
+      await setDoc(roomDoc('room_state', 'game_status'), {
         worldCompleteness: 0,
         status: 'PLAYING',
         lastUpdate: serverTimestamp()
@@ -764,7 +1571,7 @@ export default function App() {
       setCurrentPuzzle(newPuzzle);
 
       // 同步到 Firebase（让其他玩家看到）
-      const puzzleRef = doc(db, 'artifacts', appId, 'public', 'data', 'room_state', 'current_puzzle');
+      const puzzleRef = roomDoc('room_state', 'current_puzzle');
       await setDoc(puzzleRef, {
         ...newPuzzle,
         generatedBy: username,
@@ -774,7 +1581,7 @@ export default function App() {
       // (Data already cleared)
 
       // Reset Game Status
-      await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'room_state', 'game_status'), {
+      await setDoc(roomDoc('room_state', 'game_status'), {
         worldCompleteness: 0,
         status: 'PLAYING',
         lastUpdate: serverTimestamp()
@@ -789,32 +1596,40 @@ export default function App() {
 
     } catch (error) {
       console.error('Error generating puzzle:', error);
+      setCurrentPuzzle(DEMO_PUZZLE);
       addSystemLog(`ERROR: ${error.message}`);
     } finally {
       setIsGenerating(false);
+      if (initialGeneration) setIsInitialPuzzleLoading(false);
       // Release Lock
       try {
-        const lockRef = doc(db, 'artifacts', appId, 'public', 'data', 'room_state', 'lock');
+        const lockRef = roomDoc('room_state', 'lock');
         await setDoc(lockRef, { isGenerating: false });
       } catch (e) { console.error("Error releasing lock", e); }
     }
   };
 
   const openGenerateModal = () => {
+    if (!canManageRoom) {
+      addSystemLog('只有房主可以设置出题主题。');
+      return;
+    }
+
+    setSelectedPuzzleType('random');
     setThemeKeywords('');
     setShowNewGameModal(true);
   };
 
   const confirmGenerate = () => {
     setShowNewGameModal(false);
-    handleGeneratePuzzle({ theme: themeKeywords });
+    handleStartGame(buildPuzzleGenerationOptions(selectedPuzzleType, themeKeywords));
   };
 
   // --- Rendering Helpers ---
   const renderNewGameModal = () => (
     showNewGameModal && (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
-        <div className={`w-full max-w-md border ${THEME.border} ${THEME.bg} p-6 relative shadow-2xl animate-fadeIn`}>
+        <div className={`w-full max-w-2xl max-h-[90dvh] overflow-y-auto border ${THEME.border} ${THEME.bg} p-6 relative shadow-2xl animate-fadeIn`}>
           <button
             onClick={() => setShowNewGameModal(false)}
             className="absolute top-4 right-4 text-[#666] hover:text-[#fff]"
@@ -823,22 +1638,50 @@ export default function App() {
           </button>
 
           <h2 className="text-xl font-bold mb-4 flex items-center gap-2 text-[var(--color-primary)]">
-            <Activity size={20} /> GENERATE NEW SOUP
+            <Activity size={20} /> 选择本轮类型
           </h2>
 
           <div className="mb-6">
             <label className={`block text-xs uppercase tracking-widest ${THEME.textDim} mb-2`}>
-              Scenario Keywords / Theme (Optional)
+              海龟汤类型
+            </label>
+            <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+              {PUZZLE_TYPE_OPTIONS.map((option) => {
+                const isSelected = selectedPuzzleType === option.id;
+
+                return (
+                  <button
+                    key={option.id}
+                    type="button"
+                    onClick={() => setSelectedPuzzleType(option.id)}
+                    className={`min-h-[72px] border p-3 text-left transition-colors ${isSelected
+                      ? 'border-[var(--color-primary)] bg-[var(--color-primary)] text-[var(--color-inverse)]'
+                      : `${THEME.border} ${THEME.bgSoft} hover:border-[var(--color-primary)]`
+                      }`}
+                  >
+                    <span className="block text-sm font-bold">{option.label}</span>
+                    <span className={`block text-[10px] mt-1 ${isSelected ? 'opacity-80' : THEME.textDim}`}>
+                      {option.description}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="mb-6">
+            <label className={`block text-xs uppercase tracking-widest ${THEME.textDim} mb-2`}>
+              场景关键词 / 主题（可选）
             </label>
             <input
               type="text"
               value={themeKeywords}
               onChange={(e) => setThemeKeywords(e.target.value)}
-              placeholder="e.g. Cyberpunk, Ancient School, Time Loop..."
-              className={`w-full bg-black/50 border ${THEME.border} p-3 outline-none focus:border-[var(--color-primary)] transition-colors text-sm font-mono`}
+              placeholder="例如：赛博朋克、旧校舍、时间循环..."
+              className={`w-full ${THEME.bgSoft} border ${THEME.border} p-3 outline-none focus:border-[var(--color-primary)] transition-colors text-sm font-mono`}
             />
             <p className="text-[10px] text-[#666] mt-2 font-mono">
-              Leave empty for completely random generation.
+              类型为随机且关键词留空时，会完全随机生成本轮谜题。
             </p>
           </div>
 
@@ -847,20 +1690,205 @@ export default function App() {
               onClick={() => setShowNewGameModal(false)}
               className={`flex-1 py-3 border ${THEME.border} hover:bg-[var(--color-surface)] transition-colors text-xs font-bold`}
             >
-              CANCEL
+              取消
             </button>
             <button
               onClick={confirmGenerate}
               className={`flex-1 py-3 bg-[var(--color-primary)] text-[var(--color-inverse)] font-bold text-xs hover:opacity-90 transition-opacity flex items-center justify-center gap-2`}
             >
               {isGenerating ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
-              GENERATE
+              开始生成
             </button>
           </div>
         </div>
       </div>
     )
   );
+
+  const renderAIConfigModal = () => {
+    const activeAIChannel = getActiveAIChannelDraft(aiConfigDraft);
+
+    return (
+      showAIConfigModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
+          <div className={`w-full max-w-3xl max-h-[92dvh] overflow-y-auto border ${THEME.border} ${THEME.bg} p-6 relative shadow-2xl animate-fadeIn`}>
+            <button
+              onClick={() => setShowAIConfigModal(false)}
+              className="absolute top-4 right-4 text-[#666] hover:text-[#fff]"
+            >
+              <X size={20} />
+            </button>
+
+            <h2 className="text-xl font-bold mb-4 flex items-center gap-2 text-[var(--color-primary)]">
+              <Settings size={20} /> AI 配置
+            </h2>
+
+            {!aiConfigUnlocked ? (
+              <form onSubmit={unlockAIConfig} className="space-y-5">
+                <p className={`text-xs ${THEME.textDim} leading-relaxed`}>
+                  这里可以修改多个 AI 渠道、模型、接口地址和 API Key。进入配置页需要输入 AI 配置密码。
+                </p>
+                <div>
+                  <label className={`block text-xs uppercase tracking-widest ${THEME.textDim} mb-2`}>
+                    AI 配置密码
+                  </label>
+                  <input
+                    type="password"
+                    value={aiConfigPasscode}
+                    onChange={(e) => setAIConfigPasscode(e.target.value)}
+                    className={`w-full bg-black/50 border ${THEME.border} p-3 outline-none focus:border-[var(--color-primary)] transition-colors text-sm font-mono`}
+                    placeholder="输入 AI 配置密码"
+                    autoFocus
+                  />
+                </div>
+                {aiConfigNotice && <p className="text-xs text-[var(--color-error)]">{aiConfigNotice}</p>}
+                <button
+                  type="submit"
+                  className={`w-full py-3 bg-[var(--color-primary)] text-[var(--color-inverse)] font-bold text-xs hover:opacity-90 transition-opacity`}
+                >
+                  解锁配置
+                </button>
+              </form>
+            ) : (
+              <form onSubmit={handleSaveAIConfig} className="space-y-5">
+                <div className="grid grid-cols-1 md:grid-cols-[220px_1fr] gap-4">
+                  <section className={`border ${THEME.border} ${THEME.bgPanel} p-3`}>
+                    <div className="flex items-center justify-between gap-2 mb-3">
+                      <span className={`text-xs ${THEME.textDim} uppercase tracking-widest`}>渠道</span>
+                      <span className={`text-[10px] ${THEME.textDim}`}>{aiConfigDraft.channels.length} 个</span>
+                    </div>
+                    <div className="space-y-2">
+                      {aiConfigDraft.channels.map((channel) => (
+                        <button
+                          type="button"
+                          key={channel.id}
+                          onClick={() => setAIConfigDraft((prev) => ({ ...prev, activeChannelId: channel.id }))}
+                          className={`w-full border px-3 py-2 text-left text-xs font-bold transition-colors ${channel.id === aiConfigDraft.activeChannelId
+                            ? 'border-[var(--color-primary)] bg-[var(--color-primary)] text-[var(--color-inverse)]'
+                            : `${THEME.border} ${THEME.textDim} hover:border-[var(--color-primary)]`
+                            }`}
+                        >
+                          <span className="block truncate">{channel.name || '未命名渠道'}</span>
+                          <span className="block truncate text-[10px] opacity-70">{channel.model || '未设置模型'}</span>
+                        </button>
+                      ))}
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 mt-3">
+                      <button
+                        type="button"
+                        onClick={handleAddAIChannel}
+                        className={`border ${THEME.border} py-2 text-xs font-bold hover:border-[var(--color-primary)]`}
+                      >
+                        新增
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleRemoveAIChannel}
+                        disabled={aiConfigDraft.channels.length <= 1}
+                        className={`border ${THEME.border} py-2 text-xs font-bold ${aiConfigDraft.channels.length > 1 ? 'hover:border-[var(--color-error)] hover:text-[var(--color-error)]' : 'opacity-50 cursor-not-allowed'}`}
+                      >
+                        删除
+                      </button>
+                    </div>
+                  </section>
+
+                  <section className="space-y-4">
+                    <div>
+                      <label className={`block text-xs uppercase tracking-widest ${THEME.textDim} mb-2`}>
+                        渠道名称
+                      </label>
+                      <input
+                        type="text"
+                        value={activeAIChannel?.name || ''}
+                        onChange={(e) => updateActiveAIChannel({ name: e.target.value })}
+                        className={`w-full bg-black/50 border ${THEME.border} p-3 outline-none focus:border-[var(--color-primary)] transition-colors text-sm font-mono`}
+                        placeholder="例如：DeepSeek / MiniMax / 本地代理"
+                      />
+                    </div>
+
+                    <div>
+                      <label className={`block text-xs uppercase tracking-widest ${THEME.textDim} mb-2`}>
+                        API 地址（Base URL 或完整端点）
+                      </label>
+                      <input
+                        type="url"
+                        value={activeAIChannel?.apiUrl || ''}
+                        onChange={(e) => updateActiveAIChannel({ apiUrl: e.target.value })}
+                        className={`w-full bg-black/50 border ${THEME.border} p-3 outline-none focus:border-[var(--color-primary)] transition-colors text-sm font-mono`}
+                        placeholder="https://api.minimaxi.com/v1"
+                      />
+                      <p className={`text-[10px] ${THEME.textDim} mt-2`}>
+                        可以填 SDK 的 Base URL，例如 https://api.minimaxi.com/v1；系统会自动补 /chat/completions。
+                      </p>
+                    </div>
+
+                    <div>
+                      <label className={`block text-xs uppercase tracking-widest ${THEME.textDim} mb-2`}>
+                        模型
+                      </label>
+                      <input
+                        type="text"
+                        value={activeAIChannel?.model || ''}
+                        onChange={(e) => updateActiveAIChannel({ model: e.target.value })}
+                        className={`w-full bg-black/50 border ${THEME.border} p-3 outline-none focus:border-[var(--color-primary)] transition-colors text-sm font-mono`}
+                        placeholder="deepseek-v4-flash"
+                      />
+                    </div>
+
+                    <div>
+                      <label className={`block text-xs uppercase tracking-widest ${THEME.textDim} mb-2`}>
+                        API Key
+                      </label>
+                      <input
+                        type="password"
+                        value={activeAIChannel?.apiKey || ''}
+                        onChange={(e) => updateActiveAIChannel({ apiKey: e.target.value })}
+                        className={`w-full bg-black/50 border ${THEME.border} p-3 outline-none focus:border-[var(--color-primary)] transition-colors text-sm font-mono`}
+                        placeholder="留空则沿用当前渠道 Key"
+                      />
+                      <p className={`text-[10px] ${THEME.textDim} mt-2`}>
+                        {activeAIChannel?.hasStoredKey ? '当前渠道已有 Key；留空会沿用，输入新 Key 会替换。' : '未填写 Key 时会使用服务端 .env 代理配置。'}
+                      </p>
+                    </div>
+                  </section>
+                </div>
+
+                <label className={`flex items-start gap-3 text-xs ${THEME.textDim} leading-relaxed`}>
+                  <input
+                    type="checkbox"
+                    checked={rememberAIKey}
+                    onChange={(e) => setRememberAIKey(e.target.checked)}
+                    className="mt-0.5"
+                  />
+                  <span>
+                    记住 Key 到本机浏览器。开启后所有渠道的 API Key 会写入 localStorage；关闭时 Key 只保存在本次会话。
+                  </span>
+                </label>
+
+                {aiConfigNotice && <p className={`text-xs ${aiConfigNotice.includes('恢复') ? THEME.textDim : 'text-[var(--color-primary)]'}`}>{aiConfigNotice}</p>}
+
+                <div className="flex gap-3">
+                  <button
+                    type="button"
+                    onClick={handleResetAIConfig}
+                    className={`flex-1 py-3 border ${THEME.border} hover:bg-[var(--color-surface)] transition-colors text-xs font-bold`}
+                  >
+                    恢复默认
+                  </button>
+                  <button
+                    type="submit"
+                    className={`flex-1 py-3 bg-[var(--color-primary)] text-[var(--color-inverse)] font-bold text-xs hover:opacity-90 transition-opacity`}
+                  >
+                    保存并启用
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+        </div>
+      )
+    );
+  };
 
   // --- Access Control ---
   if (!isAuthorized) {
@@ -871,15 +1899,18 @@ export default function App() {
           <div className="absolute inset-0 pointer-events-none bg-gradient-to-b from-transparent via-[var(--color-primary)]/5 to-transparent h-1 w-full animate-scan"></div>
 
           <Lock size={32} className="mx-auto mb-4 animate-pulse" />
-          <h1 className="text-xl mb-2 font-bold tracking-widest">ACCESS RESTRICTED</h1>
-          <p className="text-[10px] mb-6 opacity-70">SECURE TERMINAL // AUTH REQUIRED</p>
+          <h1 className="text-xl mb-2 font-bold tracking-widest">访问受限</h1>
+          <p className="text-[10px] mb-6 opacity-70">安全终端 // 需要密码</p>
           <form onSubmit={(e) => {
             e.preventDefault();
-            const validPass = import.meta.env.VITE_ACCESS_PASSWORD || "8888";
+            const validPass = getRoomAccessPassword();
             if (passcode === validPass) {
               setIsAuthorized(true);
+              if (typeof window !== 'undefined') {
+                window.localStorage.setItem(ACCESS_STORAGE_KEY, 'true');
+              }
             } else {
-              alert("ACCESS DENIED"); // Simple alert for now, or use state for error
+              alert("密码错误"); // Simple alert for now, or use state for error
               setPasscode("");
             }
           }}>
@@ -893,7 +1924,7 @@ export default function App() {
               maxLength={6}
             />
             <button type="submit" className={`w-full border ${THEME.border} py-2 hover:bg-[var(--color-primary)] hover:text-black font-bold transition-colors text-xs tracking-widest`}>
-              UNLOCK
+              解锁
             </button>
           </form>
         </div>
@@ -904,14 +1935,78 @@ export default function App() {
   if (!user) {
     return (
       <div className={`h-[100dvh] w-full ${THEME.bg} ${THEME.primary} flex flex-col items-center justify-center font-mono p-4 text-center`}>
-        <div className="mb-4">INITIALIZING UPLINK...</div>
+        <div className="mb-4">正在连接...</div>
         {authError && (
           <div className="text-red-500 max-w-md border border-red-500 p-4 bg-red-950/30">
-            <h3 className="font-bold mb-2">CONNECTION FAILURE</h3>
+            <h3 className="font-bold mb-2">连接失败</h3>
             <p className="text-xs">{authError}</p>
-            <p className={`text-xs mt-2 ${THEME.textDim}`}>Please check your network or Firebase configuration.</p>
+            <p className={`text-xs mt-2 ${THEME.textDim}`}>请检查网络或 Firebase 配置。</p>
           </div>
         )}
+      </div>
+    );
+  }
+
+  if (!roomId) {
+    return (
+      <div className={`h-[100dvh] w-full ${THEME.bg} ${THEME.primary} font-mono flex flex-col items-center justify-center p-4`}>
+        <button
+          onClick={openAIConfig}
+          className={`absolute top-4 right-4 border ${THEME.border} px-3 py-2 text-xs flex items-center gap-2 hover:border-[var(--color-primary)]`}
+        >
+          <Settings size={14} /> AI 配置
+        </button>
+        <div className={`max-w-md w-full border ${THEME.border} p-8 relative`}>
+          <div className={`absolute top-0 left-0 ${THEME.primary} bg-[var(--color-bg)] border ${THEME.border} text-xs px-2 py-1`}>房间入口</div>
+          <h1 className="text-4xl mb-3 mt-4 tracking-tighter">海龟汤<span className="animate-pulse">_</span></h1>
+          <p className={`text-xs ${THEME.textDim} mb-8 leading-relaxed`}>
+            创建房间后邀请玩家加入；所有人准备后由房主开始游戏。
+          </p>
+          <form onSubmit={(e) => { e.preventDefault(); handleEnterRoom(); }} className="space-y-6">
+            <div>
+              <label className={`block text-xs ${THEME.textDim} mb-2 uppercase tracking-widest`}>房间号</label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={roomInput}
+                  onChange={e => setRoomInput(e.target.value)}
+                  className={`min-w-0 flex-1 ${THEME.bg} border ${THEME.border} p-3 ${THEME.primary} focus:border-[var(--color-border-active)] outline-none placeholder-[var(--color-text-dim)] text-base md:text-sm`}
+                  placeholder="例如：8821"
+                  maxLength={24}
+                  autoFocus
+                />
+                <button
+                  type="button"
+                  onClick={() => setRoomInput(createRoomId())}
+                  className={`w-12 border ${THEME.border} flex items-center justify-center hover:border-[var(--color-primary)]`}
+                  title="刷新房间号"
+                  aria-label="刷新房间号"
+                >
+                  <RefreshCw size={16} />
+                </button>
+              </div>
+              <p className={`text-[10px] ${THEME.textDim} mt-2`}>
+                可以使用数字、英文、中文和短横线。
+              </p>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <button
+                type="button"
+                onClick={handleCreateRoom}
+                className={`w-full bg-[var(--color-primary)] text-[var(--color-inverse)] font-bold py-3 transition-opacity hover:opacity-90 flex items-center justify-center gap-2`}
+              >
+                <Activity size={18} /> 创建房间
+              </button>
+              <button
+                type="submit"
+                className={`w-full ${THEME.bg} border ${THEME.border} ${THEME.primary} hover:border-[var(--color-primary)] font-bold py-3 transition-colors flex items-center justify-center gap-2`}
+              >
+                <Hash size={18} /> 加入房间
+              </button>
+            </div>
+          </form>
+        </div>
+        {renderAIConfigModal()}
       </div>
     );
   }
@@ -919,18 +2014,44 @@ export default function App() {
   if (!joined) {
     return (
       <div className={`h-[100dvh] w-full ${THEME.bg} ${THEME.primary} font-mono flex flex-col items-center justify-center p-4`}>
+        <button
+          onClick={openAIConfig}
+          className={`absolute top-4 right-4 border ${THEME.border} px-3 py-2 text-xs flex items-center gap-2 hover:border-[var(--color-primary)]`}
+        >
+          <Settings size={14} /> AI 配置
+        </button>
         <div className={`max-w-md w-full border ${THEME.border} p-8 relative`}>
-          <div className={`absolute top-0 left-0 ${THEME.primary} bg-[var(--color-bg)] border ${THEME.border} text-xs px-2 py-1`}>SECURE_LOGIN</div>
-          <h1 className="text-4xl mb-8 mt-4 tracking-tighter">TURTLE_SOUP<span className="animate-pulse">_</span></h1>
+          <div className={`absolute top-0 left-0 ${THEME.primary} bg-[var(--color-bg)] border ${THEME.border} text-xs px-2 py-1`}>
+            {roomEntryMode === 'create' ? '创建房间' : '加入房间'}
+          </div>
+          <h1 className="text-4xl mb-8 mt-4 tracking-tighter">海龟汤<span className="animate-pulse">_</span></h1>
+          <div className={`mb-6 text-xs border ${THEME.border} ${THEME.bgPanel} p-3 flex items-center justify-between gap-3`}>
+            <span className="flex items-center gap-2 min-w-0">
+              <Hash size={14} />
+              <span className="truncate">当前房间：{roomId}</span>
+            </span>
+            <button
+              type="button"
+              onClick={handleLeaveRoom}
+              className={`${THEME.textDim} hover:text-[var(--color-primary)] shrink-0`}
+            >
+              换房间
+            </button>
+          </div>
+          {authError && (
+            <div className={`mb-4 text-xs border border-[var(--color-error)] text-[var(--color-error)] p-3`}>
+              {authError}
+            </div>
+          )}
           <form onSubmit={(e) => { e.preventDefault(); handleJoin(); }} className="space-y-6">
             <div>
-              <label className={`block text-xs ${THEME.textDim} mb-2 uppercase tracking-widest`}>Identify Yourself</label>
+              <label className={`block text-xs ${THEME.textDim} mb-2 uppercase tracking-widest`}>输入你的昵称</label>
               <input
                 type="text"
                 value={username}
                 onChange={e => setUsername(e.target.value)}
                 className={`w-full ${THEME.bg} border ${THEME.border} p-3 ${THEME.primary} focus:border-[var(--color-border-active)] outline-none placeholder-[var(--color-text-dim)] text-base md:text-sm`}
-                placeholder="CODENAME"
+                placeholder="昵称"
                 maxLength={10}
                 autoFocus
               />
@@ -939,9 +2060,168 @@ export default function App() {
               type="submit"
               className={`w-full ${THEME.bg} border ${THEME.border} ${THEME.primary} hover:opacity-80 font-bold py-3 transition-colors flex items-center justify-center gap-2`}
             >
-              <Activity size={18} /> ESTABLISH CONNECTION
+              <Activity size={18} /> {roomEntryMode === 'create' ? '创建并进入' : '进入房间'}
             </button>
           </form>
+        </div>
+        {renderAIConfigModal()}
+      </div>
+    );
+  }
+
+  if (gamePhase === 'LOBBY') {
+    return (
+      <div className={`h-[100dvh] w-full ${THEME.bg} ${THEME.text} ${THEME.font} flex flex-col overflow-hidden`}>
+        <header className={`border-b ${THEME.border} px-4 py-3 shrink-0 flex items-center justify-between gap-3`}>
+          <div className="min-w-0">
+            <div className={`text-[10px] ${THEME.textDim} tracking-[0.24em] font-bold mb-1`}>准备大厅</div>
+            <div className="font-bold tracking-[0.16em] flex items-center gap-2 min-w-0">
+              <Hash size={16} className="shrink-0" />
+              <span className="truncate">房间_{roomId}</span>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={handleLeaveRoom}
+            className={`text-xs ${THEME.textDim} hover:text-[var(--color-primary)] shrink-0`}
+          >
+            换房间
+          </button>
+        </header>
+
+        <main className="flex-1 overflow-y-auto p-4 md:p-8">
+          <div className="w-full max-w-3xl mx-auto space-y-4">
+            <section className={`border ${THEME.border} ${THEME.bgPanel} p-4 md:p-5`}>
+              <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                <div>
+                  <div className={`text-xs ${THEME.textDim} mb-2`}>房主：{roomOwner?.name || '等待中'}{isRoomOwner ? '（你）' : ''}</div>
+                  <div className="text-2xl font-bold tracking-[0.18em]">{roomId}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={copyRoomLink}
+                  className={`border ${THEME.border} px-3 py-2 text-xs font-bold hover:border-[var(--color-primary)]`}
+                >
+                  复制链接
+                </button>
+              </div>
+            </section>
+
+            <section className={`border ${THEME.border} ${THEME.bgPanel} p-4 md:p-5`}>
+              <div className="flex items-center justify-between mb-4">
+                <h2 className={`text-xs ${THEME.textDim} uppercase tracking-[0.2em] flex items-center gap-2`}>
+                  <Users size={14} /> 玩家
+                </h2>
+                <span className={`text-xs ${THEME.textDim}`}>{activePlayers.length} 人在线</span>
+              </div>
+
+              <div className="space-y-2">
+                {activePlayers.length === 0 ? (
+                  <div className={`text-sm ${THEME.textDim} border ${THEME.border} p-4 text-center`}>等待玩家加入...</div>
+                ) : activePlayers.map((player) => {
+                  const playerIsOwner = roomOwner?.uid === player.uid;
+                  const playerReady = playerIsOwner || player.ready;
+
+                  return (
+                    <div
+                      key={player.uid}
+                      className={`border ${player.uid === user.uid ? 'border-[var(--color-primary)]' : THEME.border} ${THEME.bg} p-3 flex items-center justify-between gap-3`}
+                    >
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className={`w-9 h-9 ${playerReady ? 'bg-[var(--color-primary)] text-[var(--color-inverse)]' : `${THEME.bgSoft} border ${THEME.border} ${THEME.textDim}`} flex items-center justify-center font-bold text-xs shrink-0`}>
+                          {playerReady ? 'OK' : '--'}
+                        </div>
+                        <div className="min-w-0">
+                          <div className="text-sm font-bold truncate">
+                            {player.name}{player.uid === user.uid ? '（你）' : ''}
+                            {playerIsOwner && (
+                              <span className={`ml-2 text-[10px] border ${THEME.border} px-1 ${THEME.textDim}`}>房主</span>
+                            )}
+                          </div>
+                          <div className={`text-[10px] ${playerReady ? 'text-[var(--color-primary)]' : THEME.textDim}`}>
+                            {playerIsOwner ? '房主就绪' : (player.ready ? '已准备' : '未准备')}
+                          </div>
+                        </div>
+                      </div>
+                      <span className={`text-xs shrink-0 ${playerReady ? 'text-[var(--color-primary)]' : THEME.textDim}`}>
+                        {playerReady ? 'READY' : 'WAIT'}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+
+            <section className="flex flex-col md:flex-row gap-3">
+              {isRoomOwner ? (
+                <div className={`flex-1 border-2 border-[var(--color-primary)] bg-[var(--color-primary)] text-[var(--color-inverse)] py-4 text-center font-bold`}>
+                  房主就绪
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleToggleReady}
+                  className={`flex-1 border-2 py-4 font-bold transition-colors ${currentPlayer?.ready
+                    ? 'border-[var(--color-primary)] bg-[var(--color-primary)] text-[var(--color-inverse)]'
+                    : `${THEME.border} ${THEME.bg} hover:border-[var(--color-primary)]`
+                    }`}
+                >
+                  {currentPlayer?.ready ? '取消准备' : '准备'}
+                </button>
+              )}
+
+              {canManageRoom ? (
+                <div className="flex-1">
+                  <button
+                    type="button"
+                    onClick={openGenerateModal}
+                    disabled={!allActivePlayersReady || isGenerating || isGenerationLocked}
+                    className={`w-full border-2 py-4 font-bold transition-colors flex items-center justify-center gap-2 ${allActivePlayersReady && !isGenerating && !isGenerationLocked
+                      ? 'border-[var(--color-primary)] text-[var(--color-primary)] hover:bg-[var(--color-primary)] hover:text-[var(--color-inverse)]'
+                      : `${THEME.border} ${THEME.textDim} cursor-not-allowed opacity-60`
+                      }`}
+                  >
+                    {isGenerating || isGenerationLocked ? (
+                      <>
+                        <Loader2 size={18} className="animate-spin" /> 正在开始
+                      </>
+                    ) : (
+                      <>
+                        <Activity size={18} /> 选择类型并开始
+                      </>
+                    )}
+                  </button>
+                </div>
+              ) : (
+                <div className={`flex-1 border ${THEME.border} ${THEME.bgSoft} ${THEME.textDim} py-4 text-center text-sm`}>
+                  等待房主开始
+                </div>
+              )}
+            </section>
+
+            <section className={`border ${THEME.border} ${THEME.bgSoft} p-4 font-mono text-[10px] max-h-40 overflow-y-auto`}>
+              {systemLogs.slice(0, 8).map((log, index) => (
+                <LogItem key={`${log}-${index}`} message={log} />
+              ))}
+            </section>
+          </div>
+        </main>
+        {renderNewGameModal()}
+        {renderAIConfigModal()}
+      </div>
+    );
+  }
+
+  if (isInitialPuzzleLoading || gamePhase === 'STARTING' || !currentPuzzle) {
+    return (
+      <div className={`h-[100dvh] w-full ${THEME.bg} ${THEME.primary} font-mono flex flex-col items-center justify-center p-4 text-center`}>
+        <div className={`w-full max-w-md border ${THEME.border} ${THEME.bgPanel} p-8 relative overflow-hidden`}>
+          <div className="absolute inset-0 pointer-events-none bg-gradient-to-b from-transparent via-[var(--color-primary)]/10 to-transparent h-2 w-full animate-scan"></div>
+          <Loader2 size={34} className="mx-auto mb-5 animate-spin" />
+          <h1 className="text-xl font-bold mb-3 tracking-widest">AI 正在生成海龟汤</h1>
+          <p className={`text-xs ${THEME.textDim} leading-relaxed`}>
+            房间 {roomId} 的房主正在准备新谜题，请稍等片刻。
+          </p>
         </div>
       </div>
     );
@@ -954,7 +2234,7 @@ export default function App() {
         {/* Header */}
         <header className={`h-12 border-b ${THEME.border} flex items-center justify-center px-4 shrink-0`}>
           <span className="font-bold tracking-widest text-[var(--color-primary)] animate-pulse">
-            {'>>'} CASE CLOSED {'<<'}
+            {'>>'} 案件结束 // 房间 {roomId} {'<<'}
           </span>
         </header>
 
@@ -972,14 +2252,14 @@ export default function App() {
 
             {/* 汤面回顾 */}
             <div className={`border ${THEME.border} p-4 ${THEME.bgPanel}`}>
-              <h2 className={`text-xs ${THEME.textDim} uppercase tracking-widest mb-3`}>汤面 (The Puzzle)</h2>
+              <h2 className={`text-xs ${THEME.textDim} uppercase tracking-widest mb-3`}>汤面</h2>
               <p className="text-sm leading-relaxed">{currentPuzzle.content}</p>
             </div>
 
             {/* 汤底揭晓 */}
             <div className={`border-2 border-[var(--color-primary)] p-6 ${THEME.bgPanel} relative`}>
               <div className={`absolute -top-3 left-4 bg-[var(--color-bg)] px-2 text-xs text-[var(--color-primary)] uppercase tracking-widest`}>
-                汤底 (The Truth)
+                汤底
               </div>
               <p className="text-sm leading-relaxed mt-2">{currentPuzzle.truth}</p>
             </div>
@@ -989,13 +2269,10 @@ export default function App() {
               <h2 className={`text-xs ${THEME.textDim} uppercase tracking-widest mb-3`}>排行榜</h2>
               <div className="space-y-2">
                 {players
+                  .slice()
                   .sort((a, b) => (b.score || 0) - (a.score || 0))
-                  // 简单过滤：如果 lastSeen 距离现在超过 90 秒则视为离线 (考虑到延迟，放宽一点)
-                  //但在渲染阶段很难直接比较 serverTimestamp，这里先假设后端会处理或者前端接受所有数据
-                  // 更好的做法是在 players sync 时转换 timestamp 为 Date 对象
                   .map((p, idx) => {
-                    const lastSeenMs = p.lastSeen?.seconds ? p.lastSeen.seconds * 1000 : 0;
-                    const isOffline = (Date.now() - lastSeenMs) > 60000; // 60s timeout
+                    const isOffline = !isPlayerActive(p, now);
 
                     return (
                       <div key={p.uid} className={`flex items-center justify-between text-sm ${isOffline ? 'opacity-40 grayscale' : ''}`}>
@@ -1004,10 +2281,15 @@ export default function App() {
                             {idx + 1}
                           </span>
                           <span className={p.uid === user.uid ? 'text-[var(--color-primary)] font-bold' : ''}>
-                            {p.name} {p.uid === user.uid && '(You)'} {isOffline && '(OFFLINE)'}
+                            {p.name} {p.uid === user.uid && '（你）'} {isOffline && '（离线）'}
                           </span>
+                          {roomOwner?.uid === p.uid && (
+                            <span className={`text-[10px] border ${THEME.border} px-1.5 py-0.5 ${THEME.textDim}`}>
+                              房主
+                            </span>
+                          )}
                         </div>
-                        <span className="font-bold">{p.score || 0} PTS</span>
+                        <span className="font-bold">{p.score || 0} 分</span>
                       </div>
                     )
                   })}
@@ -1016,18 +2298,22 @@ export default function App() {
 
             {/* 新游戏按钮 */}
             <button
-              onClick={openGenerateModal}
-              disabled={isGenerating || (generationLock?.isGenerating && (Date.now() - (generationLock.timestamp?.seconds * 1000 || 0) < 60000))}
+              onClick={handleResetToLobby}
+              disabled={!canManageRoom || isGenerating || isGenerationLocked}
               className={`w-full border-2 border-[var(--color-primary)] ${THEME.bg} text-[var(--color-primary)] hover:bg-[var(--color-primary)] hover:text-[var(--color-inverse)] font-bold py-4 transition-colors flex items-center justify-center gap-2 text-lg disabled:opacity-50 disabled:cursor-not-allowed`}
             >
-              {isGenerating || (generationLock?.isGenerating && (Date.now() - (generationLock.timestamp?.seconds * 1000 || 0) < 60000)) ? (
+              {!canManageRoom ? (
+                <>
+                  <Lock size={24} /> 仅房主可开始新一轮
+                </>
+              ) : isGenerating || isGenerationLocked ? (
                 <>
                   <RefreshCw size={24} className="animate-spin" />
                   {isGenerating ? '正在生成...' : `锁定中 (${generationLock?.by})`}
                 </>
               ) : (
                 <>
-                  <Activity size={24} /> 开始新一轮
+                  <Activity size={24} /> 回到准备大厅
                 </>
               )}
             </button>
@@ -1041,41 +2327,108 @@ export default function App() {
   return (
     <div className={`fixed inset-0 w-full ${THEME.bg} ${THEME.text} ${THEME.font} flex flex-col overflow-hidden selection:bg-[var(--color-primary)] selection:text-[var(--color-inverse)]`}>
       {/* HEADER */}
-      <header className={`h-12 border-b ${THEME.border} flex items-center justify-between px-4 shrink-0`}>
-        <div className="flex items-center gap-4">
-          <span className="font-bold tracking-widest flex items-center gap-2">
-            <Hash size={16} /> ROOM_8821
-          </span>
-          <div className="flex items-center gap-1 text-xs">
-            {/* TRUTH Moved to Right */}
-          </div>
-          {isGlobalLoading ? (
-            <div className="flex items-center gap-2 text-[var(--color-primary)] animate-pulse">
-              <Loader2 size={12} className="animate-spin" />
-              <span className="text-[10px] font-bold">AI_PROCESSING...</span>
+      <header className={`border-b ${THEME.border} flex flex-col gap-2 px-3 py-2 md:h-12 md:flex-row md:items-center md:justify-between md:px-4 md:py-0 shrink-0`}>
+        <div className="flex w-full min-w-0 items-center justify-between gap-3 md:w-auto md:justify-start">
+          <div className="flex min-w-0 items-center gap-4">
+            <div className="min-w-0">
+              <div className={`md:hidden text-[10px] leading-none ${THEME.textDim} font-bold tracking-[0.22em]`}>房间</div>
+              <span className="font-bold flex items-center gap-1.5 md:gap-2 leading-tight tracking-[0.16em] md:tracking-widest min-w-0">
+                <Hash size={16} className="shrink-0" />
+                <span className="hidden md:inline">房间_{roomId}</span>
+                <span className="md:hidden truncate text-xl">_{roomId}</span>
+              </span>
             </div>
-          ) : (
-            <span className="text-xs text-[#666] hidden md:inline">Latency: 12ms</span>
-          )}
+            {roomOwner?.name && (
+              <span className={`text-xs ${THEME.textDim} hidden md:inline`}>
+                房主：{roomOwner.name}{isRoomOwner ? '（你）' : ''}
+              </span>
+            )}
+            <button
+              onClick={handleLeaveRoom}
+              className={`text-xs ${THEME.textDim} hover:text-[var(--color-primary)] hidden md:inline`}
+              title="退出当前房间"
+            >
+              换房间
+            </button>
+            {isGlobalLoading ? (
+              <div className="hidden md:flex items-center gap-2 text-[var(--color-primary)] animate-pulse">
+                <Loader2 size={12} className="animate-spin" />
+                <span className="text-[10px] font-bold">AI 思考中...</span>
+              </div>
+            ) : (
+              <span className="text-xs text-[#666] hidden md:inline">延迟：12ms</span>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2 md:hidden">
+            <button
+              onClick={() => setTheme(theme === 'night' ? 'day' : 'night')}
+              className={`h-10 w-10 rounded-md ${THEME.border} border hover:opacity-80 transition-opacity flex items-center justify-center`}
+              title="切换主题"
+              aria-label="切换主题"
+            >
+              {theme === 'night' ? <Sun size={18} className={THEME.primary} /> : <Moon size={18} className={THEME.primary} />}
+            </button>
+            <button
+              onClick={openAIConfig}
+              className={`h-10 w-10 rounded-md ${THEME.border} border hover:opacity-80 transition-opacity flex items-center justify-center`}
+              title="AI 配置"
+              aria-label="AI 配置"
+            >
+              <Settings size={18} className={THEME.primary} />
+            </button>
+            <button
+              onClick={() => setPersona(persona === 'TERMINAL' ? 'MESUGAKI' : 'TERMINAL')}
+              className={`h-10 w-10 rounded-md ${THEME.border} border hover:opacity-80 transition-opacity flex items-center justify-center ${persona === 'MESUGAKI' ? 'bg-pink-500/10 border-pink-500 text-pink-500' : ''}`}
+              title={persona === 'TERMINAL' ? "切换到性格模式" : "切换到终端模式"}
+              aria-label={persona === 'TERMINAL' ? "切换到性格模式" : "切换到终端模式"}
+            >
+              {persona === 'TERMINAL' ? <TerminalSquare size={18} /> : <MessageCircle size={18} />}
+            </button>
+          </div>
         </div>
-        <div className="flex items-center gap-4">
+
+        <div className="flex w-full items-center gap-2 md:hidden" title={`真相完整度：${worldCompleteness}%`}>
+          <span className={`text-[10px] uppercase font-bold ${THEME.textDim} tracking-[0.2em] shrink-0`}>真相</span>
+          <div className={`h-2 flex-1 ${THEME.bgSoft} border ${THEME.border} relative overflow-hidden`}>
+            <div
+              className={`h-full bg-[var(--color-primary)] transition-all duration-1000 ease-out`}
+              style={{ width: `${worldCompleteness}%` }}
+            ></div>
+          </div>
+          <span className={`text-xs w-10 text-right font-mono shrink-0 ${worldCompleteness >= 80 ? 'text-[var(--color-primary)] shadow-glow' : ''}`}>
+            {worldCompleteness}%
+          </span>
+        </div>
+
+        <div className="hidden md:flex items-center gap-4">
           <button
             onClick={() => setTheme(theme === 'night' ? 'day' : 'night')}
-            className={`p-1 rounded ${THEME.border} border hover:opacity-80 transition-opacity`}
-            title="Toggle Theme"
+            className={`h-7 w-7 rounded ${THEME.border} border hover:opacity-80 transition-opacity flex items-center justify-center`}
+            title="切换主题"
+            aria-label="切换主题"
           >
             {theme === 'night' ? <Sun size={14} className={THEME.primary} /> : <Moon size={14} className={THEME.primary} />}
           </button>
           <button
+            onClick={openAIConfig}
+            className={`h-7 w-7 rounded ${THEME.border} border hover:opacity-80 transition-opacity flex items-center justify-center`}
+            title="AI 配置"
+            aria-label="AI 配置"
+          >
+            <Settings size={14} className={THEME.primary} />
+          </button>
+          <button
             onClick={() => setPersona(persona === 'TERMINAL' ? 'MESUGAKI' : 'TERMINAL')}
-            className={`p-1 rounded ${THEME.border} border hover:opacity-80 transition-opacity flex items-center gap-1 px-2 ${persona === 'MESUGAKI' ? 'bg-pink-500/10 border-pink-500 text-pink-500' : ''}`}
-            title={persona === 'TERMINAL' ? "Switch to Personality Mode" : "Switch to Terminal Mode"}
+            className={`h-7 rounded ${THEME.border} border hover:opacity-80 transition-opacity flex items-center gap-1 px-2 ${persona === 'MESUGAKI' ? 'bg-pink-500/10 border-pink-500 text-pink-500' : ''}`}
+            title={persona === 'TERMINAL' ? "切换到性格模式" : "切换到终端模式"}
+            aria-label={persona === 'TERMINAL' ? "切换到性格模式" : "切换到终端模式"}
           >
             {persona === 'TERMINAL' ? <TerminalSquare size={14} /> : <MessageCircle size={14} />}
-            <span className="text-[10px] font-bold hidden md:inline">{persona === 'TERMINAL' ? 'SYS' : 'U-14'}</span>
+            <span className="text-[10px] font-bold">{persona === 'TERMINAL' ? 'SYS' : 'U-14'}</span>
           </button>
-          <div className="flex gap-2 items-center" title={`World Completeness: ${worldCompleteness}%`}>
-            <span className={`text-[10px] uppercase font-bold ${THEME.textDim}`}>TRUTH</span>
+          <div className="flex gap-2 items-center" title={`真相完整度：${worldCompleteness}%`}>
+            <span className={`text-[10px] uppercase font-bold ${THEME.textDim}`}>真相</span>
             <div className="flex gap-1 items-center">
               <div className={`w-24 h-2 ${THEME.bgSoft} border ${THEME.border} relative overflow-hidden`}>
                 <div
@@ -1093,9 +2446,9 @@ export default function App() {
 
       {/* MOBILE TABS */}
       <div className={`md:hidden flex border-b ${THEME.border} text-xs sticky top-0 z-20 ${THEME.bg}`}>
-        <button onClick={() => setActiveTab('CASE')} className={`flex-1 py-4 text-center font-bold transition-colors ${activeTab === 'CASE' ? `border-b-2 border-[var(--color-primary)] text-[var(--color-primary)]` : THEME.textDim}`}>CASE FILE</button>
-        <button onClick={() => setActiveTab('TERMINAL')} className={`flex-1 py-4 text-center font-bold transition-colors ${activeTab === 'TERMINAL' ? `border-b-2 border-[var(--color-primary)] text-[var(--color-primary)]` : THEME.textDim}`}>TERMINAL</button>
-        <button onClick={() => setActiveTab('SQUAD')} className={`flex-1 py-4 text-center font-bold transition-colors ${activeTab === 'SQUAD' ? `border-b-2 border-[var(--color-primary)] text-[var(--color-primary)]` : THEME.textDim}`}>SQUAD</button>
+        <button onClick={() => setActiveTab('CASE')} className={`flex-1 py-4 text-center font-bold transition-colors ${activeTab === 'CASE' ? `border-b-2 border-[var(--color-primary)] text-[var(--color-primary)]` : THEME.textDim}`}>案情</button>
+        <button onClick={() => setActiveTab('TERMINAL')} className={`flex-1 py-4 text-center font-bold transition-colors ${activeTab === 'TERMINAL' ? `border-b-2 border-[var(--color-primary)] text-[var(--color-primary)]` : THEME.textDim}`}>提问</button>
+        <button onClick={() => setActiveTab('SQUAD')} className={`flex-1 py-4 text-center font-bold transition-colors ${activeTab === 'SQUAD' ? `border-b-2 border-[var(--color-primary)] text-[var(--color-primary)]` : THEME.textDim}`}>玩家</button>
       </div>
 
       {/* MAIN LAYOUT */}
@@ -1110,17 +2463,22 @@ export default function App() {
         `}>
           <div className={`p-4 border-b ${THEME.border}`}>
             <div className="flex items-center justify-between mb-4">
-              <h2 className={`text-xs ${THEME.textDim} uppercase tracking-[0.2em]`}>The Soup</h2>
+              <h2 className={`text-xs ${THEME.textDim} uppercase tracking-[0.2em]`}>汤面</h2>
               <button
-                onClick={openGenerateModal}
-                disabled={isGenerating || (generationLock?.isGenerating && (Date.now() - (generationLock.timestamp?.seconds * 1000 || 0) < 60000)) || (gamePhase === 'PLAYING' && ADMIN_UID && user.uid !== ADMIN_UID)}
+                onClick={handleResetToLobby}
+                disabled={!canManageRoom || isGenerating || isGenerationLocked}
                 className={`text-xs px-3 py-1.5 border ${THEME.border} flex items-center gap-2 transition-all
-                  ${isGenerating || (generationLock?.isGenerating && (Date.now() - (generationLock.timestamp?.seconds * 1000 || 0) < 60000)) || (gamePhase === 'PLAYING' && ADMIN_UID && user.uid !== ADMIN_UID)
+                  ${!canManageRoom || isGenerating || isGenerationLocked
                     ? 'opacity-50 cursor-not-allowed'
                     : 'hover:border-[var(--color-primary)] hover:text-[var(--color-primary)]'
                   }`}
               >
-                {isGenerating || (generationLock?.isGenerating && (Date.now() - (generationLock.timestamp?.seconds * 1000 || 0) < 60000)) ? (
+                {!canManageRoom ? (
+                  <>
+                    <Lock size={12} />
+                    房主专用
+                  </>
+                ) : isGenerating || isGenerationLocked ? (
                   <>
                     <RefreshCw size={12} className="animate-spin" />
                     {isGenerating ? '本地生成中...' : `锁定中 (${generationLock?.by})`}
@@ -1128,7 +2486,7 @@ export default function App() {
                 ) : (
                   <>
                     <Sparkles size={12} />
-                    {gamePhase === 'PLAYING' && ADMIN_UID && user.uid !== ADMIN_UID ? 'LOCKED (ADMIN ONLY)' : '生成新谜题'}
+                    回准备大厅
                   </>
                 )}
               </button>
@@ -1179,20 +2537,20 @@ export default function App() {
 
           <div className="flex-1 p-4 overflow-y-auto min-h-0">
             <h2 className={`text-xs ${THEME.textDim} uppercase tracking-[0.2em] mb-4 flex items-center gap-2`}>
-              <FileText size={12} /> Evidence
+              <FileText size={12} /> 线索
             </h2>
             <ul className="space-y-3">
-              {clues.length === 0 && <li className={`text-xs ${THEME.textDim} italic`}>No evidence collected yet...</li>}
+              {clues.length === 0 && <li className={`text-xs ${THEME.textDim} italic`}>还没有收集到线索...</li>}
               {clues.map((c, i) => (
                 <li key={i} className={`text-xs border-l-2 border-[var(--color-primary)] pl-2 py-2 animate-fadeIn`}>
-                  <span className={`block ${THEME.textDim} text-xs mb-1 font-bold`}>DATA_FRAGMENT_{i + 1} // {c.unlockedBy}</span>
+                  <span className={`block ${THEME.textDim} text-xs mb-1 font-bold`}>线索片段_{i + 1} // {c.unlockedBy}</span>
                   <span className="leading-relaxed">{c.text}</span>
                 </li>
               ))}
               {/* Locked Placeholders */}
               {[...Array(3)].map((_, i) => (
                 <li key={`locked-${i}`} className={`text-xs ${THEME.textDim} opacity-50 font-bold select-none`}>
-                  [ENCRYPTED_DATA_BLOCK_{i + 9}]
+                  [加密线索_{i + 9}]
                 </li>
               ))}
             </ul>
@@ -1212,8 +2570,8 @@ export default function App() {
           >
             {/* Intro Message */}
             <div className={`opacity-50 text-xs text-center border-b ${THEME.border} pb-4 mb-4`}>
-              -- SECURE CHANNEL ESTABLISHED --<br />
-              -- AI HOST ONLINE --
+              -- 安全频道已建立 --<br />
+              -- AI 主持人在线 --
             </div>
 
             {messages.map((msg) => {
@@ -1226,9 +2584,9 @@ export default function App() {
                   {/* Header */}
                   <div className={`flex items-center gap-2 text-xs ${THEME.textDim} mb-1`}>
                     <span className={isMe ? `text-[var(--color-primary)]` : ''}>
-                      {isAI ? '>> SYSTEM' : `[${msg.sender}]`}
+                      {isAI ? '>> 系统' : `[${msg.sender}]`}
                     </span>
-                    <span>{msg.timestamp?.toDate().toLocaleTimeString()}</span>
+                    <span>{formatTimestampTime(msg.timestamp)}</span>
                   </div>
 
                   {/* Content */}
@@ -1243,7 +2601,7 @@ export default function App() {
                     {isAI ? (
                       <Typewriter text={msg.text} />
                     ) : (
-                      <span>{isAttempt ? `> ATTEMPT: ${msg.text}` : `$ ${msg.text}`}</span>
+                      <span>{isAttempt ? `> 猜汤底：${msg.text}` : `$ ${msg.text}`}</span>
                     )}
                   </div>
                 </div>
@@ -1264,23 +2622,23 @@ export default function App() {
                 `}
               >
                 {inputMode === 'QUERY' ? <ToggleLeft size={14} /> : <ToggleRight size={14} />}
-                MODE: {inputMode === 'SOLVE' ? 'SOLVE (汤底)' : 'QUERY (提问)'}
+                模式：{inputMode === 'SOLVE' ? '猜汤底' : '提问'}
               </button>
               {inputMode === 'SOLVE' && (
-                <span className={`text-[10px] text-[var(--color-warn)] animate-pulse`}>WARNING: INCORRECT GUESSES COST DATA INTEGRITY</span>
+                <span className={`text-[10px] text-[var(--color-warn)] animate-pulse`}>注意：猜汤底前请尽量确认完整真相</span>
               )}
             </div>
 
             <form onSubmit={handleSendMessage} className="flex gap-2 relative">
               <span className={`self-center font-bold ${inputMode === 'SOLVE' ? `text-[var(--color-warn)]` : `text-[var(--color-primary)]`}`}>
-                {inputMode === 'SOLVE' ? 'SOLVE >' : 'query >'}
+                {inputMode === 'SOLVE' ? '汤底 >' : '提问 >'}
               </span>
               <input
                 type="text"
                 value={inputText}
                 onChange={e => setInputText(e.target.value)}
                 className={`flex-1 bg-transparent border-b ${inputMode === 'SOLVE' ? `border-[var(--color-warn)]` : THEME.border} focus:border-[var(--color-primary)] outline-none text-[var(--color-text)] font-mono h-10 text-base md:text-sm`}
-                placeholder={inputMode === 'SOLVE' ? "Describe the full story..." : "Ask a Yes/No question..."}
+                placeholder={inputMode === 'SOLVE' ? "描述你认为完整的真相..." : "输入一个是/否问题..."}
                 autoFocus
               />
               <button type="submit" className={`${THEME.textDim} hover:text-[var(--color-primary)]`}>
@@ -1300,20 +2658,14 @@ export default function App() {
           {/* Leaderboard */}
           <div className="flex-1 p-4 overflow-y-auto min-h-0">
             <h2 className={`text-xs ${THEME.textDim} uppercase tracking-[0.2em] mb-4 flex items-center gap-2`}>
-              <Users size={12} /> Unit Status
+              <Users size={12} /> 玩家状态
             </h2>
             <div className="space-y-4">
-              {players.length === 0 ? (
-                <div className={`text-[10px] ${THEME.textDim} py-4 text-center`}>SCANNING FOR UNITS...</div>
+              {activePlayers.length === 0 ? (
+                <div className={`text-[10px] ${THEME.textDim} py-4 text-center`}>正在扫描玩家...</div>
               ) : (
-                players
-                  .filter(p => {
-                    // 过滤离线玩家 (70s 超时)
-                    if (!p.lastSeen) return true; // 兼容旧数据，暂不移除
-                    const lastSeenTime = p.lastSeen.toDate ? p.lastSeen.toDate().getTime() : 0;
-                    if (lastSeenTime === 0) return true;
-                    return (now - lastSeenTime) < 70000;
-                  })
+                activePlayers
+                  .slice()
                   .sort((a, b) => (b.score || 0) - (a.score || 0)).map(p => (
                     <div key={p.uid} className={`flex items-center justify-between border ${p.uid === user.uid ? `border-[var(--color-primary)] ${THEME.bgPanel}` : `border-transparent opacity-80`} p-2`}>
                       <div className="flex items-center gap-3">
@@ -1321,9 +2673,16 @@ export default function App() {
                           {p.name.substring(0, 2).toUpperCase()}
                         </div>
                         <div>
-                          <div className={`text-xs font-bold ${p.uid === user.uid ? 'text-[var(--color-primary)]' : ''}`}>{p.name}</div>
+                          <div className={`text-xs font-bold ${p.uid === user.uid ? 'text-[var(--color-primary)]' : ''}`}>
+                            {p.name}
+                            {roomOwner?.uid === p.uid && (
+                              <span className={`ml-2 text-[10px] border ${THEME.border} px-1 ${THEME.textDim}`}>
+                                房主
+                              </span>
+                            )}
+                          </div>
                           <div className={`text-[10px] ${THEME.textDim} flex items-center gap-2`}>
-                            <span>SANITY: {p.queryCount ?? 10}/10</span>
+                            <span>提问次数：{p.queryCount ?? MAX_QUERY_COUNT}/{MAX_QUERY_COUNT}</span>
                           </div>
                         </div>
                       </div>
@@ -1337,13 +2696,13 @@ export default function App() {
           {/* System Log */}
           <div className={`h-1/3 border-t ${THEME.border} p-4 ${THEME.bgSoft} font-mono text-[10px] overflow-y-auto`}>
             <h2 className={`${THEME.textDim} uppercase mb-2 flex items-center gap-2`}>
-              <Cpu size={10} /> Sys.log
+              <Cpu size={10} /> 系统日志
             </h2>
             <div className={`space-y-1 ${THEME.textDim}`}>
               {systemLogs.map((log, i) => (
                 <LogItem key={i} message={log} />
               ))}
-              <div>&gt; SYSTEM READY</div>
+              <div>&gt; 系统就绪</div>
             </div>
           </div>
         </div>
@@ -1353,6 +2712,7 @@ export default function App() {
       {/* New Game Modal */}
       {/* New Game Modal */}
       {renderNewGameModal()}
+      {renderAIConfigModal()}
 
       {/* Global CSS for animations */}
       <style>{`

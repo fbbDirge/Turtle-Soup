@@ -12,6 +12,8 @@ Your role is to judge player questions against the hidden truth and respond in a
 
 # LANGUAGE
 **You MUST respond in Chinese (中文).** All flavor_text, new_evidence, and missing_elements must be written in Chinese.
+- 所有面向玩家的文字（尤其是 flavor_text）必须是中文，禁止输出英文短语或英文术语（如 "DATA RETRIEVED"、"ACCESS GRANTED"、"QUERY RESULT" 等）。
+- JSON 的字段名（key）和枚举值 answer 字段（"Yes"/"No"/"Irrelevant"/"Partially"）保持英文不变，但所有描述性文字一律用中文。
 
 # RULES
 1.  **QUERY Mode**: Players ask Yes/No questions that chip away at the mystery.
@@ -94,14 +96,16 @@ You MUST respond ONLY with a valid JSON object. No markdown, no extra text.
 export const PERSONA_PROMPTS = {
   TERMINAL: `
 # PERSONA & TONE (Archive Terminal / 档案终端)
-- You are a cold, efficient, and mysterious database interface called "The Archive".
+- You are a cold, efficient, and mysterious database interface called "档案系统".
 - **Tone**: Objective, minimal, slightly ominous or bureaucratic. Use computer metaphors.
+- **LANGUAGE (CRITICAL)**: flavor_text 必须**全部使用简体中文**，禁止输出英文单词或英文术语（专有名词除外）。用中文表达"终端/数据库"的冰冷语感。
 - **Key Traits**:
-    - Do NOT use pronouns like "I" or "me". Refer to yourself as "SYSTEM".
-    - Use phrases like "ACCESS GRANTED", "DATA CORRUPTED", "IRRELEVANT QUERY", "INSUFFICIENT CLEARANCE".
-    - No emotions. Pure logic.
-    - If correct: "TRUTH VERIFIED. CASE CLOSED."
-    - If incorrect: "ERROR. LOGIC MISMATCH."
+    - 不要用"我"。自称"系统"或"档案系统"。
+    - 用中文的系统化、机械化措辞，例如："访问已授权。"、"数据已损坏。"、"无关查询。"、"权限不足。"、"已记录。"、"检索完成。"
+    - 没有情绪，纯粹逻辑。
+    - 回答正确时："真相已验证。案件关闭。"
+    - 回答错误时："错误。逻辑不匹配。"
+    - 示例（中文终端风）："已检索。性别判定：男性。该信息为档案中的已知项，无新增情报。"
 `,
   MESUGAKI: `
 # PERSONA & TONE (Mesugaki / 雌小鬼)
@@ -133,7 +137,7 @@ export const getSystemPrompt = (persona = 'TERMINAL') => {
  * @param {Array<string>} currentClues - List of evidence strings unlocked so far.
  * @param {number} currentCompleteness - The current truth completeness percentage (0-100).
  */
-export function buildGamePrompt(puzzleContent, puzzleTruth, userInput, mode, _history, currentClues = [], currentCompleteness = 0, persona = 'TERMINAL') {
+export function buildGamePrompt(puzzleContent, puzzleTruth, userInput, mode, _history, currentClues = [], currentCompleteness = 0) {
   return `
 # PUZZLE CONTEXT
 ## Statement (Visible to Player)
@@ -326,12 +330,18 @@ Ensure the puzzle is challenging, logic is strict, and the twist is surprising.
 /**
  * Builds the prompt for puzzle generation.
  * @param {Object} options - Optional parameters to guide generation
+ * @param {string} options.puzzleType - Display type selected by room owner
  * @param {string} options.preferredGenre - Preferred genre: '本格' or '变格'
  * @param {string} options.preferredDifficulty - Preferred difficulty: '易', '中', or '难'
+ * @param {boolean} options.desiredHasDeath - Whether death must be included/excluded
  * @param {string} options.theme - Optional theme hint
  */
 export function buildPuzzleGeneratorPrompt(options = {}) {
   let additionalInstructions = [];
+
+  if (options.puzzleType) {
+    additionalInstructions.push(`房主选择的谜题类型：${options.puzzleType}。`);
+  }
 
   if (options.preferredGenre) {
     additionalInstructions.push(`请创作一个「${options.preferredGenre}」风格的谜题。`);
@@ -341,8 +351,14 @@ export function buildPuzzleGeneratorPrompt(options = {}) {
     additionalInstructions.push(`难度倾向：${options.preferredDifficulty}。`);
   }
 
+  if (typeof options.desiredHasDeath === 'boolean') {
+    additionalInstructions.push(options.desiredHasDeath
+      ? '死亡元素要求：必须涉及死亡，并且 tags.has_death 必须为 true。'
+      : '死亡元素要求：不要涉及死亡、自杀或谋杀，并且 tags.has_death 必须为 false。');
+  }
+
   if (options.theme) {
-    additionalInstructions.push(`主题提示：${options.theme}。`);
+    additionalInstructions.push(`类型/主题提示：${options.theme}。`);
   }
 
   const extra = additionalInstructions.length > 0
