@@ -48,6 +48,7 @@ import {
   Settings,
   Loader2,
   X,
+  UserX, // For kick player
   MessageCircle, // For Mesugaki icon
   TerminalSquare // For Terminal icon
 } from 'lucide-react';
@@ -469,6 +470,8 @@ export default function App() {
 
   // Refs
   const scrollRef = useRef(null);
+  // 标记自己是否被房主踢出：被踢后心跳不再自动重新注册，且触发自动退出
+  const kickedRef = useRef(false);
 
   // --- Auth & Setup ---
   const [authError, setAuthError] = useState(null);
@@ -722,7 +725,20 @@ export default function App() {
     // 3. Sync Players
     const playersQuery = query(roomCollection('players'));
     const unsubPlayers = onSnapshot(playersQuery, (snapshot) => {
-      setPlayers(snapshot.docs.map(doc => doc.data()));
+      const nextPlayers = snapshot.docs.map(doc => doc.data());
+      setPlayers(nextPlayers);
+
+      // 被踢检测：自己已加入，但玩家列表里已经没有自己 → 被房主移除
+      if (joined && user?.uid && !kickedRef.current) {
+        const stillInRoom = nextPlayers.some((p) => p.uid === user.uid);
+        if (!stillInRoom) {
+          kickedRef.current = true; // 阻止心跳重新注册
+          if (typeof window !== 'undefined') {
+            window.alert('你已被房主移出房间。');
+          }
+          handleLeaveRoom();
+        }
+      }
     }, (err) => console.error("Players sync error", err));
 
     // 4. Sync Puzzle
@@ -888,11 +904,14 @@ export default function App() {
     const userRef = roomDoc('players', user.uid);
 
     const heartbeatInterval = setInterval(async () => {
+      if (kickedRef.current) return; // 已被踢出，停止心跳，避免被重新注册
       try {
         // 只更新 lastSeen，不更新其它字段
         await updateDoc(userRef, { lastSeen: serverTimestamp() });
       } catch (err) {
         console.error("Heartbeat error:", err);
+        // 被踢出后不要重新注册
+        if (kickedRef.current) return;
         // 如果文档不存在（被清除），尝试重新注册
         if (err.code === 'not-found' || err.message.includes('No document to update')) {
           try {
@@ -922,6 +941,7 @@ export default function App() {
 
   const handleJoin = async () => {
     if (!username.trim()) return;
+    kickedRef.current = false; // 重新加入房间，清除被踢标记
     const cleanUsername = username.trim();
     if (typeof window !== 'undefined') {
       window.localStorage.setItem(USERNAME_STORAGE_KEY, cleanUsername);
@@ -1070,6 +1090,32 @@ export default function App() {
       addSystemLog(`${username} ${nextReady ? '已准备' : '取消准备'}。`);
     } catch (error) {
       addSystemLog(`READY ERROR: ${error.message}`);
+    }
+  };
+
+  // 房主/管理员将玩家移出房间（仅 Firebase 在线模式）
+  const handleKickPlayer = async (targetPlayer) => {
+    if (!targetPlayer || !canManageRoom) return;
+    if (targetPlayer.uid === user?.uid) return; // 不能踢自己
+    if (roomOwner?.uid === targetPlayer.uid) return; // 不能踢房主
+
+    if (!db) {
+      addSystemLog('本地演示模式暂不支持踢人。');
+      return;
+    }
+
+    if (typeof window !== 'undefined') {
+      const confirmed = window.confirm(`确定将「${targetPlayer.name}」移出房间吗？`);
+      if (!confirmed) return;
+    }
+
+    try {
+      // 删除玩家文档：被踢者客户端会在 players 同步时检测到自己已不在列表并自动退出
+      await deleteDoc(roomDoc('players', targetPlayer.uid));
+      addSystemLog(`${targetPlayer.name} 已被 ${username} 移出房间。`);
+    } catch (error) {
+      console.error('Kick failed:', error);
+      addSystemLog(`KICK ERROR: ${error.message}`);
     }
   };
 
@@ -2143,9 +2189,21 @@ export default function App() {
                           </div>
                         </div>
                       </div>
-                      <span className={`text-xs shrink-0 ${playerReady ? 'text-[var(--color-primary)]' : THEME.textDim}`}>
-                        {playerReady ? 'READY' : 'WAIT'}
-                      </span>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <span className={`text-xs ${playerReady ? 'text-[var(--color-primary)]' : THEME.textDim}`}>
+                          {playerReady ? 'READY' : 'WAIT'}
+                        </span>
+                        {canManageRoom && db && !playerIsOwner && player.uid !== user.uid && (
+                          <button
+                            type="button"
+                            onClick={() => handleKickPlayer(player)}
+                            title={`将 ${player.name} 移出房间`}
+                            className={`p-1 border ${THEME.border} ${THEME.textDim} hover:border-[var(--color-error)] hover:text-[var(--color-error)] transition-colors`}
+                          >
+                            <UserX size={14} />
+                          </button>
+                        )}
+                      </div>
                     </div>
                   );
                 })}
@@ -2686,7 +2744,19 @@ export default function App() {
                           </div>
                         </div>
                       </div>
-                      <div className="text-lg font-bold">{p.score || 0}</div>
+                      <div className="flex items-center gap-2">
+                        <div className="text-lg font-bold">{p.score || 0}</div>
+                        {canManageRoom && db && roomOwner?.uid !== p.uid && p.uid !== user.uid && (
+                          <button
+                            type="button"
+                            onClick={() => handleKickPlayer(p)}
+                            title={`将 ${p.name} 移出房间`}
+                            className={`p-1 border ${THEME.border} ${THEME.textDim} hover:border-[var(--color-error)] hover:text-[var(--color-error)] transition-colors`}
+                          >
+                            <UserX size={12} />
+                          </button>
+                        )}
+                      </div>
                     </div>
                   ))
               )}
