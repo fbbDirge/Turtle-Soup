@@ -481,8 +481,21 @@ export default function App() {
   const applyLocalRoomState = (state) => {
     if (!state) return;
 
+    const nextPlayers = Object.values(state.players || {});
+    if (!db && joined && user?.uid && !kickedRef.current) {
+      const stillInRoom = nextPlayers.some((player) => player.uid === user.uid);
+      if (!stillInRoom) {
+        kickedRef.current = true;
+        if (typeof window !== 'undefined') {
+          window.alert('你已被房主移出房间。');
+        }
+        handleLeaveRoom();
+        return;
+      }
+    }
+
     setRoomOwner(state.owner || null);
-    setPlayers(Object.values(state.players || {}));
+    setPlayers(nextPlayers);
     setMessages(state.messages || []);
     setClues(state.clues || []);
     setSystemLogs(state.systemLogs || []);
@@ -848,6 +861,7 @@ export default function App() {
     if (!user || !joined || !roomId || db) return;
 
     const sendHeartbeat = () => {
+      if (kickedRef.current) return;
       requestLocalRoom(roomId, 'heartbeat', {
         uid: user.uid,
         name: username || 'Unknown'
@@ -864,6 +878,7 @@ export default function App() {
 
     const markLocalOffline = (event) => {
       if (event?.persisted) return;
+      if (kickedRef.current) return;
       if (!db) {
         sendLocalRoomBeacon(roomId, 'leave', {
           uid: user.uid,
@@ -874,6 +889,7 @@ export default function App() {
     };
 
     const markLocalOnline = () => {
+      if (kickedRef.current) return;
       if (!db) {
         requestLocalRoom(roomId, 'heartbeat', {
           uid: user.uid,
@@ -1093,20 +1109,31 @@ export default function App() {
     }
   };
 
-  // 房主/管理员将玩家移出房间（仅 Firebase 在线模式）
+  // 房主/管理员将玩家移出房间
   const handleKickPlayer = async (targetPlayer) => {
     if (!targetPlayer || !canManageRoom) return;
     if (targetPlayer.uid === user?.uid) return; // 不能踢自己
     if (roomOwner?.uid === targetPlayer.uid) return; // 不能踢房主
 
-    if (!db) {
-      addSystemLog('本地演示模式暂不支持踢人。');
-      return;
-    }
-
     if (typeof window !== 'undefined') {
       const confirmed = window.confirm(`确定将「${targetPlayer.name}」移出房间吗？`);
       if (!confirmed) return;
+    }
+
+    if (!db) {
+      try {
+        const result = await requestLocalRoom(roomId, 'kick', {
+          uid: user.uid,
+          name: username || '房主',
+          targetUid: targetPlayer.uid,
+          targetName: targetPlayer.name
+        });
+        applyLocalRoomState(result.state);
+      } catch (error) {
+        console.error('Local kick failed:', error);
+        addSystemLog(`KICK ERROR: ${error.message}`);
+      }
+      return;
     }
 
     try {
@@ -2193,7 +2220,7 @@ export default function App() {
                         <span className={`text-xs ${playerReady ? 'text-[var(--color-primary)]' : THEME.textDim}`}>
                           {playerReady ? 'READY' : 'WAIT'}
                         </span>
-                        {canManageRoom && db && !playerIsOwner && player.uid !== user.uid && (
+                        {canManageRoom && !playerIsOwner && player.uid !== user.uid && (
                           <button
                             type="button"
                             onClick={() => handleKickPlayer(player)}
@@ -2746,7 +2773,7 @@ export default function App() {
                       </div>
                       <div className="flex items-center gap-2">
                         <div className="text-lg font-bold">{p.score || 0}</div>
-                        {canManageRoom && db && roomOwner?.uid !== p.uid && p.uid !== user.uid && (
+                        {canManageRoom && roomOwner?.uid !== p.uid && p.uid !== user.uid && (
                           <button
                             type="button"
                             onClick={() => handleKickPlayer(p)}

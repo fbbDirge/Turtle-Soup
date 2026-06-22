@@ -268,6 +268,34 @@ export default defineConfig(({ mode }) => {
                 return
               }
 
+              if (action === 'kick') {
+                const uid = String(body.uid || '').trim()
+                const targetUid = String(body.targetUid || '').trim()
+                const name = String(body.name || '房主')
+                const targetName = String(body.targetName || room.players[targetUid]?.name || '玩家')
+
+                if (!uid || room.owner?.uid !== uid) {
+                  sendJson(res, 403, { error: { message: '只有房主可以移出玩家。' } })
+                  return
+                }
+
+                if (!targetUid || !room.players[targetUid]) {
+                  sendJson(res, 404, { error: { message: '玩家不在房间中。' } })
+                  return
+                }
+
+                if (targetUid === uid || room.owner?.uid === targetUid) {
+                  sendJson(res, 403, { error: { message: '不能移出自己或房主。' } })
+                  return
+                }
+
+                delete room.players[targetUid]
+                localRooms.addLog(room, `${targetName} 已被 ${name} 移出房间。`)
+                localRooms.broadcast(room)
+                sendJson(res, 200, { state: localRooms.snapshot(room) })
+                return
+              }
+
               if (action === 'ready') {
                 const uid = String(body.uid || '').trim()
                 const ready = Boolean(body.ready)
