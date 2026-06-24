@@ -17,6 +17,7 @@
 *   **AI Game Master**: 由大语言模型 (LLM) 扮演主持人，实时回答玩家的提问。
 *   **多人实时协作**: 支持多名玩家在一个房间内共同解谜，聊天和线索实时同步 (基于 Firebase)。
 *   **动态谜题生成**: 内置谜题生成器，可根据关键词（如：恐怖、悬疑、搞笑）无限生成新的谜题。
+*   **管理面板**: 访问 `/admin` 可查看本地房间模式下的房间记录、玩家名字/IP、设备信息、使用记录和聊天记录。
 *   **智能裁判系统**:
     *   **自动判定**: AI 自动判断玩家问题是 "是"、"否"、"无关" 或 "部分正确"。
     *   **防剧透机制**: 严格的 Prompt Engineering 防止 AI 直接泄露真相。
@@ -64,6 +65,7 @@ cp .env.example .env
 *   `VITE_GEMINI_API_URL`: API 端点 (例如 `https://api.openai.com/v1/chat/completions` 或任何兼容服务)。
 *   `VITE_ACCESS_PASSWORD`: (可选) 房间访问密码。
 *   `VITE_AI_CONFIG_PASSWORD`: (可选) AI 配置页密码；不设置时会回退使用房间访问密码。
+*   `ADMIN_PANEL_PASSWORD`: (可选) 管理面板密码；不设置时会回退使用 AI 配置页密码或房间访问密码。
 *   `VITE_FIREBASE_*`: 你的 Firebase 项目配置 (Key, Domain, ProjectID 等)。
 
 > **注意**: 这是一个纯前端项目 (Serverless)，你需要自行创建一个 Firebase 项目并启用 **Firestore Database** 和 **Anonymous Auth**。
