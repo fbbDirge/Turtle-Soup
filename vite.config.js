@@ -25,6 +25,24 @@ const sendJson = (res, statusCode, payload) => {
   res.end(JSON.stringify(payload))
 }
 
+const readHeader = (req, name) => {
+  const value = req.headers[name.toLowerCase()]
+  if (Array.isArray(value)) return value[0] || ''
+  return value || ''
+}
+
+const getClientIp = (req) => {
+  const forwarded = readHeader(req, 'x-forwarded-for')
+  const realIp = readHeader(req, 'x-real-ip')
+  const rawIp = forwarded.split(',')[0].trim() || realIp || req.socket?.remoteAddress || ''
+  return rawIp.replace(/^::ffff:/, '') || 'unknown'
+}
+
+const getRequestMeta = (req) => ({
+  ip: getClientIp(req),
+  userAgent: readHeader(req, 'user-agent') || 'unknown'
+})
+
 const createLocalRoomStore = () => {
   const rooms = new Map()
   let nextId = 1
@@ -35,10 +53,15 @@ const createLocalRoomStore = () => {
 
   const getRoom = (roomId) => {
     if (!rooms.has(roomId)) {
+      const now = timestamp()
       rooms.set(roomId, {
         id: roomId,
+        createdAt: now,
+        updatedAt: now,
         owner: null,
         players: {},
+        playerMeta: {},
+        records: [],
         messages: [],
         clues: [],
         systemLogs: [formatLog('系统就绪')],
@@ -47,7 +70,7 @@ const createLocalRoomStore = () => {
           worldCompleteness: 0,
           status: 'LOBBY',
           winner: null,
-          lastUpdate: timestamp()
+          lastUpdate: now
         },
         lock: {
           isGenerating: false,
@@ -73,6 +96,91 @@ const createLocalRoomStore = () => {
     lock: room.lock
   })
 
+  const touch = (room) => {
+    room.updatedAt = timestamp()
+  }
+
+  const updatePlayerMeta = (room, uid, name, requestMeta) => {
+    if (!uid) return
+    const previous = room.playerMeta[uid] || {}
+    const ips = requestMeta?.ip
+      ? Array.from(new Set([...(previous.ips || []), requestMeta.ip])).slice(-12)
+      : (previous.ips || [])
+
+    room.playerMeta[uid] = {
+      ...previous,
+      uid,
+      name: name || previous.name || room.players[uid]?.name || '玩家',
+      firstSeen: previous.firstSeen || timestamp(),
+      lastSeen: timestamp(),
+      joinIp: previous.joinIp || requestMeta?.ip || previous.joinIp || '',
+      lastIp: requestMeta?.ip || previous.lastIp || '',
+      ips,
+      userAgent: requestMeta?.userAgent || previous.userAgent || ''
+    }
+  }
+
+  const addRecord = (room, action, payload = {}, requestMeta = {}) => {
+    const record = {
+      id: makeMessageId('record'),
+      roomId: room.id,
+      action,
+      at: timestamp(),
+      uid: payload.uid || '',
+      name: payload.name || '',
+      targetUid: payload.targetUid || '',
+      targetName: payload.targetName || '',
+      ip: requestMeta.ip || '',
+      userAgent: requestMeta.userAgent || '',
+      detail: payload.detail || {}
+    }
+
+    if (record.uid) updatePlayerMeta(room, record.uid, record.name, requestMeta)
+    room.records = trimList([...(room.records || []), record], 500)
+    room.updatedAt = record.at
+    return record
+  }
+
+  const adminRoomSummary = (room) => {
+    const players = Object.values(room.players || {})
+    const activePlayers = players.filter(isActivePlayer)
+    return {
+      id: room.id,
+      createdAt: room.createdAt,
+      updatedAt: room.updatedAt,
+      owner: room.owner,
+      status: room.gameStatus?.status || 'LOBBY',
+      worldCompleteness: room.gameStatus?.worldCompleteness || 0,
+      playerCount: players.length,
+      activePlayerCount: activePlayers.length,
+      currentPuzzle: room.currentPuzzle
+        ? {
+          title: room.currentPuzzle.title,
+          difficulty: room.currentPuzzle.difficulty,
+          tags: room.currentPuzzle.tags,
+          generatedBy: room.currentPuzzle.generatedBy,
+          generatedAt: room.currentPuzzle.generatedAt
+        }
+        : null,
+      recentRecords: (room.records || []).slice(-5).reverse()
+    }
+  }
+
+  const adminRoomDetail = (room) => ({
+    ...adminRoomSummary(room),
+    players: Object.values(room.players || {}).map((player) => ({
+      ...player,
+      meta: room.playerMeta?.[player.uid] || null
+    })),
+    playerMeta: room.playerMeta || {},
+    messages: room.messages || [],
+    clues: room.clues || [],
+    systemLogs: room.systemLogs || [],
+    currentPuzzle: room.currentPuzzle || null,
+    gameStatus: room.gameStatus,
+    records: (room.records || []).slice().reverse()
+  })
+
   const broadcast = (room) => {
     const payload = `data: ${JSON.stringify(snapshot(room))}\n\n`
     for (const client of room.clients) {
@@ -82,6 +190,7 @@ const createLocalRoomStore = () => {
 
   const addLog = (room, message) => {
     room.systemLogs = [formatLog(message), ...room.systemLogs].slice(0, 20)
+    touch(room)
   }
 
   const isOwnerOffline = (room) => {
@@ -99,9 +208,14 @@ const createLocalRoomStore = () => {
 
   return {
     getRoom,
+    rooms,
     snapshot,
     broadcast,
     addLog,
+    addRecord,
+    updatePlayerMeta,
+    adminRoomSummary,
+    adminRoomDetail,
     isOwnerOffline,
     isActivePlayer,
     makeMessageId,
@@ -127,6 +241,73 @@ export default defineConfig(({ mode }) => {
     plugins: [
       react(),
       tailwindcss(),
+      {
+        name: 'local-admin-server',
+        configureServer(server) {
+          const adminPassword = env.ADMIN_PANEL_PASSWORD || env.VITE_ADMIN_PANEL_PASSWORD || env.VITE_AI_CONFIG_PASSWORD || env.VITE_ACCESS_PASSWORD || '8888'
+          const isAuthorized = (req, passwordFromBody = '') => {
+            const headerPassword = readHeader(req, 'x-admin-password')
+            return Boolean(adminPassword) && (headerPassword === adminPassword || passwordFromBody === adminPassword)
+          }
+
+          server.middlewares.use('/api/admin', async (req, res) => {
+            const url = new URL(req.url || '/', 'http://local-admin-server')
+            const pathParts = url.pathname.split('/').filter(Boolean)
+            const [resource, roomId] = pathParts
+
+            try {
+              if (req.method === 'POST' && resource === 'login') {
+                const body = JSON.parse(await readRequestBody(req) || '{}')
+                if (!isAuthorized(req, String(body.password || ''))) {
+                  sendJson(res, 401, { error: { message: '管理密码错误。' } })
+                  return
+                }
+                sendJson(res, 200, { ok: true })
+                return
+              }
+
+              if (!isAuthorized(req)) {
+                sendJson(res, 401, { error: { message: '需要管理密码。' } })
+                return
+              }
+
+              if (req.method !== 'GET') {
+                sendJson(res, 405, { error: { message: 'Method not allowed' } })
+                return
+              }
+
+              if (resource === 'rooms' && roomId) {
+                const room = localRooms.rooms.get(decodeURIComponent(roomId))
+                if (!room) {
+                  sendJson(res, 404, { error: { message: '房间不存在。' } })
+                  return
+                }
+                sendJson(res, 200, { room: localRooms.adminRoomDetail(room) })
+                return
+              }
+
+              if (!resource || resource === 'rooms') {
+                const rooms = Array.from(localRooms.rooms.values())
+                  .map(localRooms.adminRoomSummary)
+                  .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+                sendJson(res, 200, {
+                  rooms,
+                  totals: {
+                    roomCount: rooms.length,
+                    activeRoomCount: rooms.filter((room) => room.activePlayerCount > 0).length,
+                    activePlayerCount: rooms.reduce((sum, room) => sum + room.activePlayerCount, 0)
+                  }
+                })
+                return
+              }
+
+              sendJson(res, 404, { error: { message: 'Unknown admin route' } })
+            } catch (error) {
+              sendJson(res, 500, { error: { message: error.message || 'Admin request failed' } })
+            }
+          })
+        }
+      },
       {
         name: 'local-room-server',
         configureServer(server) {
@@ -171,6 +352,7 @@ export default defineConfig(({ mode }) => {
             try {
               const body = JSON.parse(await readRequestBody(req) || '{}')
               const now = localRooms.timestamp()
+              const requestMeta = getRequestMeta(req)
 
               if (action === 'join') {
                 const uid = String(body.uid || '').trim()
@@ -226,6 +408,15 @@ export default defineConfig(({ mode }) => {
                 for (const player of Object.values(room.players)) {
                   player.role = room.owner.uid === player.uid ? 'owner' : 'player'
                 }
+                localRooms.updatePlayerMeta(room, uid, name, requestMeta)
+                localRooms.addRecord(room, room.owner.uid === uid && createRoom ? 'create-room' : 'join-room', {
+                  uid,
+                  name,
+                  detail: {
+                    role: isOwner ? 'owner' : 'player',
+                    createRoom
+                  }
+                }, requestMeta)
                 localRooms.addLog(room, room.owner.uid === uid && createRoom ? `${name} 创建房间，等待玩家准备。` : `${name} 加入准备大厅。`)
                 localRooms.broadcast(room)
                 sendJson(res, 200, { owner: room.owner, state: localRooms.snapshot(room) })
@@ -235,6 +426,7 @@ export default defineConfig(({ mode }) => {
               if (action === 'heartbeat') {
                 const uid = String(body.uid || '').trim()
                 if (uid && room.players[uid]) {
+                  localRooms.updatePlayerMeta(room, uid, String(body.name || room.players[uid].name), requestMeta)
                   room.players[uid] = {
                     ...room.players[uid],
                     name: String(body.name || room.players[uid].name),
@@ -260,6 +452,7 @@ export default defineConfig(({ mode }) => {
                     lastSeen: now - 120000
                   }
                   if (!transient) {
+                    localRooms.addRecord(room, 'leave-room', { uid, name }, requestMeta)
                     localRooms.addLog(room, `${name} 离开房间。`)
                   }
                   localRooms.broadcast(room)
@@ -290,6 +483,12 @@ export default defineConfig(({ mode }) => {
                 }
 
                 delete room.players[targetUid]
+                localRooms.addRecord(room, 'kick-player', {
+                  uid,
+                  name,
+                  targetUid,
+                  targetName
+                }, requestMeta)
                 localRooms.addLog(room, `${targetName} 已被 ${name} 移出房间。`)
                 localRooms.broadcast(room)
                 sendJson(res, 200, { state: localRooms.snapshot(room) })
@@ -313,6 +512,10 @@ export default defineConfig(({ mode }) => {
                   ready: room.owner?.uid === uid ? true : ready,
                   lastSeen: now
                 }
+                localRooms.addRecord(room, ready ? 'player-ready' : 'player-unready', {
+                  uid,
+                  name: room.players[uid].name
+                }, requestMeta)
                 localRooms.addLog(room, `${room.players[uid].name} ${room.players[uid].ready ? '已准备' : '取消准备'}。`)
                 localRooms.broadcast(room)
                 sendJson(res, 200, { state: localRooms.snapshot(room) })
@@ -344,6 +547,7 @@ export default defineConfig(({ mode }) => {
                   winner: null,
                   lastUpdate: now
                 }
+                localRooms.addRecord(room, 'start-game', { uid, name }, requestMeta)
                 localRooms.addLog(room, `${name} 开始游戏，AI 正在准备谜题。`)
                 localRooms.broadcast(room)
                 sendJson(res, 200, { state: localRooms.snapshot(room) })
@@ -416,6 +620,15 @@ export default defineConfig(({ mode }) => {
                   lastUpdate: now
                 }
                 room.lock = { isGenerating: false, by: null, uid: null, timestamp: 0 }
+                localRooms.addRecord(room, 'puzzle-loaded', {
+                  uid: String(body.uid || ''),
+                  name: String(body.username || '房主'),
+                  detail: {
+                    title: puzzle.title,
+                    tags: body.tags || puzzle.tags || null,
+                    fallback: Boolean(body.error)
+                  }
+                }, requestMeta)
                 if (body.error) localRooms.addLog(room, `ERROR: ${body.error}`)
                 localRooms.addLog(room, `NEW LOCAL PUZZLE LOADED: ${puzzle.title}`)
                 if (body.tags) {
@@ -452,6 +665,7 @@ export default defineConfig(({ mode }) => {
                   winner: null,
                   lastUpdate: now
                 }
+                localRooms.addRecord(room, 'reset-lobby', { uid, name }, requestMeta)
                 localRooms.addLog(room, `${name} 开启新一轮准备。`)
                 localRooms.broadcast(room)
                 sendJson(res, 200, { state: localRooms.snapshot(room) })
@@ -476,6 +690,14 @@ export default defineConfig(({ mode }) => {
                     timestamp: now
                   }
                 ], 50)
+                localRooms.addRecord(room, 'user-message', {
+                  uid: message.senderId || 'local-user',
+                  name: message.sender || '玩家',
+                  detail: {
+                    type: message.type || 'question',
+                    text: message.text
+                  }
+                }, requestMeta)
                 localRooms.broadcast(room)
                 sendJson(res, 200, { state: localRooms.snapshot(room) })
                 return
@@ -507,6 +729,7 @@ export default defineConfig(({ mode }) => {
                     timestamp: now
                   }
                 ], 50)
+                localRooms.addRecord(room, 'skip-puzzle', { uid, name }, requestMeta)
                 localRooms.addLog(room, `${name} EXECUTED /skip. TRUTH REVEALED.`)
                 localRooms.broadcast(room)
                 sendJson(res, 200, { state: localRooms.snapshot(room) })
@@ -535,7 +758,18 @@ export default defineConfig(({ mode }) => {
                     lastQueryTime: mode === 'QUERY' ? now : player.lastQueryTime,
                     lastSeen: now
                   }
+                  localRooms.updatePlayerMeta(room, uid, name, requestMeta)
                 }
+                localRooms.addRecord(room, 'ai-response', {
+                  uid,
+                  name,
+                  detail: {
+                    mode,
+                    scoreDelta,
+                    answer: response.answer || '',
+                    isCorrect: Boolean(response.is_correct)
+                  }
+                }, requestMeta)
 
                 room.gameStatus = {
                   ...room.gameStatus,

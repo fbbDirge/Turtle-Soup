@@ -239,6 +239,10 @@ const formatTimestampTime = (value) => {
   const time = toTimestampMs(value);
   return time ? new Date(time).toLocaleTimeString() : '';
 };
+const formatDateTime = (value) => {
+  const time = toTimestampMs(value);
+  return time ? new Date(time).toLocaleString() : '暂无';
+};
 const sendLocalRoomBeacon = (roomId, action, body) => {
   if (typeof window === 'undefined' || !window.navigator?.sendBeacon || !roomId) return false;
   return window.navigator.sendBeacon(
@@ -248,6 +252,7 @@ const sendLocalRoomBeacon = (roomId, action, body) => {
 };
 const getRoomAccessPassword = () => import.meta.env.VITE_ACCESS_PASSWORD || "8888";
 const getAIConfigPassword = () => import.meta.env.VITE_AI_CONFIG_PASSWORD || import.meta.env.VITE_ACCESS_PASSWORD || "8888";
+const ADMIN_PASSWORD_STORAGE_KEY = "turtle-soup.adminPassword";
 const createAIChannelId = () => (
   `channel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 );
@@ -402,9 +407,373 @@ const LogItem = ({ message }) => {
   );
 };
 
+const AdminPanel = () => {
+  const [password, setPassword] = useState(() => (
+    typeof window === 'undefined' ? '' : window.sessionStorage.getItem(ADMIN_PASSWORD_STORAGE_KEY) || ''
+  ));
+  const [unlocked, setUnlocked] = useState(false);
+  const [rooms, setRooms] = useState([]);
+  const [totals, setTotals] = useState({ roomCount: 0, activeRoomCount: 0, activePlayerCount: 0 });
+  const [selectedRoomId, setSelectedRoomId] = useState('');
+  const [roomDetail, setRoomDetail] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [notice, setNotice] = useState('');
+  const [lastRefresh, setLastRefresh] = useState(0);
+
+  const adminRequest = async (path, options = {}) => {
+    const response = await fetch(`/api/admin${path}`, {
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-admin-password': password,
+        ...(options.headers || {})
+      }
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error?.message || data.message || `请求失败 (${response.status})`);
+    return data;
+  };
+
+  const loadRoomDetail = async (roomId) => {
+    if (!roomId) {
+      setRoomDetail(null);
+      return;
+    }
+
+    const data = await adminRequest(`/rooms/${encodeURIComponent(roomId)}`);
+    setRoomDetail(data.room || null);
+  };
+
+  const loadRooms = async (preferredRoomId = selectedRoomId) => {
+    setLoading(true);
+    try {
+      const data = await adminRequest('/rooms');
+      const nextRooms = data.rooms || [];
+      const nextSelected = preferredRoomId || nextRooms[0]?.id || '';
+      setRooms(nextRooms);
+      setTotals(data.totals || { roomCount: 0, activeRoomCount: 0, activePlayerCount: 0 });
+      setSelectedRoomId(nextSelected);
+      await loadRoomDetail(nextSelected);
+      setNotice('');
+      setLastRefresh(Date.now());
+    } catch (error) {
+      setNotice(error.message);
+      if (error.message.includes('密码') || error.message.includes('需要管理')) {
+        setUnlocked(false);
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!password || unlocked) return;
+    adminRequest('/rooms')
+      .then((data) => {
+        const nextRooms = data.rooms || [];
+        setUnlocked(true);
+        setRooms(nextRooms);
+        setTotals(data.totals || { roomCount: 0, activeRoomCount: 0, activePlayerCount: 0 });
+        setSelectedRoomId(nextRooms[0]?.id || '');
+        setLastRefresh(Date.now());
+        if (nextRooms[0]?.id) loadRoomDetail(nextRooms[0].id);
+      })
+      .catch(() => {
+        if (typeof window !== 'undefined') window.sessionStorage.removeItem(ADMIN_PASSWORD_STORAGE_KEY);
+      });
+  }, []);
+
+  useEffect(() => {
+    if (!unlocked) return;
+    const timer = setInterval(() => loadRooms(selectedRoomId), 10000);
+    return () => clearInterval(timer);
+  }, [unlocked, selectedRoomId, password]);
+
+  const handleLogin = async (event) => {
+    event.preventDefault();
+    setLoading(true);
+    try {
+      await fetch('/api/admin/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password })
+      }).then(async (response) => {
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error?.message || '管理密码错误。');
+      });
+      if (typeof window !== 'undefined') window.sessionStorage.setItem(ADMIN_PASSWORD_STORAGE_KEY, password);
+      setUnlocked(true);
+      await loadRooms();
+    } catch (error) {
+      setNotice(error.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const logout = () => {
+    if (typeof window !== 'undefined') window.sessionStorage.removeItem(ADMIN_PASSWORD_STORAGE_KEY);
+    setUnlocked(false);
+    setPassword('');
+    setRooms([]);
+    setRoomDetail(null);
+    setSelectedRoomId('');
+  };
+
+  const selectRoom = async (roomId) => {
+    setSelectedRoomId(roomId);
+    setLoading(true);
+    try {
+      await loadRoomDetail(roomId);
+      setNotice('');
+    } catch (error) {
+      setNotice(error.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (!unlocked) {
+    return (
+      <div className={`min-h-[100dvh] ${THEME.bg} ${THEME.text} ${THEME.font} flex items-center justify-center p-4`}>
+        <form onSubmit={handleLogin} className={`w-full max-w-sm border ${THEME.border} ${THEME.bgPanel} p-6 space-y-5`}>
+          <div>
+            <div className={`text-[10px] ${THEME.textDim} tracking-[0.24em] font-bold mb-2`}>ADMIN</div>
+            <h1 className="text-2xl font-bold">管理面板</h1>
+          </div>
+          <input
+            type="password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            placeholder="输入管理密码"
+            className={`w-full ${THEME.bgSoft} border ${THEME.border} p-3 outline-none focus:border-[var(--color-primary)] text-sm`}
+            autoFocus
+          />
+          {notice && <div className={`text-xs ${THEME.error}`}>{notice}</div>}
+          <button
+            type="submit"
+            disabled={loading || !password}
+            className={`w-full py-3 bg-[var(--color-primary)] text-[var(--color-inverse)] font-bold disabled:opacity-50`}
+          >
+            {loading ? '验证中...' : '进入面板'}
+          </button>
+        </form>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`min-h-[100dvh] ${THEME.bg} ${THEME.text} ${THEME.font}`}>
+      <header className={`border-b ${THEME.border} px-4 py-3 flex flex-col gap-3 md:flex-row md:items-center md:justify-between`}>
+        <div>
+          <div className={`text-[10px] ${THEME.textDim} tracking-[0.24em] font-bold mb-1`}>LOCAL ROOM ADMIN</div>
+          <h1 className="text-xl font-bold">海龟汤管理面板</h1>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className={`text-xs ${THEME.textDim}`}>刷新：{lastRefresh ? formatDateTime(lastRefresh) : '未刷新'}</span>
+          <button
+            type="button"
+            onClick={() => loadRooms(selectedRoomId)}
+            className={`border ${THEME.border} px-3 py-2 text-xs font-bold hover:border-[var(--color-primary)] flex items-center gap-2`}
+          >
+            <RefreshCw size={14} className={loading ? 'animate-spin' : ''} /> 刷新
+          </button>
+          <button
+            type="button"
+            onClick={logout}
+            className={`border ${THEME.border} px-3 py-2 text-xs font-bold hover:border-[var(--color-error)] hover:text-[var(--color-error)]`}
+          >
+            退出
+          </button>
+        </div>
+      </header>
+
+      <main className="p-4 md:p-6 space-y-4">
+        {notice && <div className={`border ${THEME.border} ${THEME.bgPanel} p-3 text-sm ${THEME.error}`}>{notice}</div>}
+
+        <section className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          {[
+            ['房间总数', totals.roomCount],
+            ['活跃房间', totals.activeRoomCount],
+            ['在线玩家', totals.activePlayerCount]
+          ].map(([label, value]) => (
+            <div key={label} className={`border ${THEME.border} ${THEME.bgPanel} p-4`}>
+              <div className={`text-xs ${THEME.textDim} mb-2`}>{label}</div>
+              <div className="text-2xl font-bold">{value}</div>
+            </div>
+          ))}
+        </section>
+
+        <section className="grid grid-cols-1 lg:grid-cols-[340px_1fr] gap-4">
+          <aside className={`border ${THEME.border} ${THEME.bgPanel} min-h-[360px]`}>
+            <div className={`border-b ${THEME.border} p-3 text-xs ${THEME.textDim} flex items-center gap-2`}>
+              <Hash size={14} /> 房间记录
+            </div>
+            <div className="divide-y divide-[var(--color-border)]">
+              {rooms.length === 0 ? (
+                <div className={`p-4 text-sm ${THEME.textDim}`}>暂无房间记录</div>
+              ) : rooms.map((room) => (
+                <button
+                  key={room.id}
+                  type="button"
+                  onClick={() => selectRoom(room.id)}
+                  className={`w-full text-left p-3 hover:bg-[var(--color-bg-soft)] ${selectedRoomId === room.id ? 'bg-[var(--color-bg-soft)] text-[var(--color-primary)]' : ''}`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold">房间_{room.id}</span>
+                    <span className={`text-[10px] ${THEME.textDim}`}>{room.status}</span>
+                  </div>
+                  <div className={`text-xs ${THEME.textDim} mt-1`}>
+                    在线 {room.activePlayerCount}/{room.playerCount} · 房主 {room.owner?.name || '无'}
+                  </div>
+                  <div className={`text-[10px] ${THEME.textDim} mt-1`}>
+                    {formatDateTime(room.updatedAt)}
+                  </div>
+                </button>
+              ))}
+            </div>
+          </aside>
+
+          <section className="space-y-4 min-w-0">
+            {!roomDetail ? (
+              <div className={`border ${THEME.border} ${THEME.bgPanel} p-6 ${THEME.textDim}`}>请选择一个房间</div>
+            ) : (
+              <>
+                <div className={`border ${THEME.border} ${THEME.bgPanel} p-4`}>
+                  <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
+                    <div>
+                      <div className={`text-xs ${THEME.textDim} mb-1`}>房间详情</div>
+                      <h2 className="text-2xl font-bold">房间_{roomDetail.id}</h2>
+                      <div className={`text-xs ${THEME.textDim} mt-2`}>
+                        创建 {formatDateTime(roomDetail.createdAt)} · 更新 {formatDateTime(roomDetail.updatedAt)}
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2 text-center">
+                      <div className={`border ${THEME.border} p-2`}>
+                        <div className="font-bold">{roomDetail.status}</div>
+                        <div className={`text-[10px] ${THEME.textDim}`}>状态</div>
+                      </div>
+                      <div className={`border ${THEME.border} p-2`}>
+                        <div className="font-bold">{roomDetail.activePlayerCount}/{roomDetail.playerCount}</div>
+                        <div className={`text-[10px] ${THEME.textDim}`}>玩家</div>
+                      </div>
+                      <div className={`border ${THEME.border} p-2`}>
+                        <div className="font-bold">{roomDetail.worldCompleteness}%</div>
+                        <div className={`text-[10px] ${THEME.textDim}`}>真相</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {roomDetail.currentPuzzle && (
+                    <div className={`mt-4 border-t ${THEME.border} pt-4 text-sm`}>
+                      <div className={`text-xs ${THEME.textDim} mb-2`}>当前谜题</div>
+                      <div className="font-bold mb-1">{roomDetail.currentPuzzle.title}</div>
+                      <div className={`${THEME.textDim} leading-relaxed`}>{roomDetail.currentPuzzle.content}</div>
+                      {roomDetail.currentPuzzle.truth && (
+                        <details className="mt-2">
+                          <summary className="cursor-pointer text-xs text-[var(--color-primary)]">查看汤底</summary>
+                          <p className="mt-2 leading-relaxed">{roomDetail.currentPuzzle.truth}</p>
+                        </details>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                <div className={`border ${THEME.border} ${THEME.bgPanel} overflow-x-auto`}>
+                  <div className={`border-b ${THEME.border} p-3 text-xs ${THEME.textDim} flex items-center gap-2`}>
+                    <Users size={14} /> 房间玩家
+                  </div>
+                  <table className="w-full text-xs min-w-[900px]">
+                    <thead className={THEME.textDim}>
+                      <tr className={`border-b ${THEME.border}`}>
+                        <th className="text-left p-3">名字</th>
+                        <th className="text-left p-3">角色/状态</th>
+                        <th className="text-left p-3">IP</th>
+                        <th className="text-left p-3">设备</th>
+                        <th className="text-left p-3">分数/次数</th>
+                        <th className="text-left p-3">最后在线</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {roomDetail.players.map((player) => (
+                        <tr key={player.uid} className={`border-b ${THEME.border}`}>
+                          <td className="p-3">
+                            <div className="font-bold">{player.name}</div>
+                            <div className={THEME.textDim}>{player.uid}</div>
+                          </td>
+                          <td className="p-3">{player.role || 'player'} · {player.status || 'UNKNOWN'} · {player.ready ? '已准备' : '未准备'}</td>
+                          <td className="p-3">
+                            <div>{player.meta?.lastIp || '未知'}</div>
+                            <div className={THEME.textDim}>{(player.meta?.ips || []).join(', ')}</div>
+                          </td>
+                          <td className="p-3 max-w-[260px] truncate" title={player.meta?.userAgent || ''}>{player.meta?.userAgent || '未知'}</td>
+                          <td className="p-3">{player.score || 0} 分 · {player.queryCount ?? MAX_QUERY_COUNT}/{MAX_QUERY_COUNT}</td>
+                          <td className="p-3">{formatDateTime(player.lastSeen || player.meta?.lastSeen)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className={`border ${THEME.border} ${THEME.bgPanel} overflow-x-auto`}>
+                  <div className={`border-b ${THEME.border} p-3 text-xs ${THEME.textDim} flex items-center gap-2`}>
+                    <Activity size={14} /> 使用记录
+                  </div>
+                  <table className="w-full text-xs min-w-[900px]">
+                    <thead className={THEME.textDim}>
+                      <tr className={`border-b ${THEME.border}`}>
+                        <th className="text-left p-3">时间</th>
+                        <th className="text-left p-3">动作</th>
+                        <th className="text-left p-3">玩家</th>
+                        <th className="text-left p-3">目标</th>
+                        <th className="text-left p-3">IP</th>
+                        <th className="text-left p-3">详情</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(roomDetail.records || []).slice(0, 120).map((record) => (
+                        <tr key={record.id} className={`border-b ${THEME.border}`}>
+                          <td className="p-3">{formatDateTime(record.at)}</td>
+                          <td className="p-3 font-bold">{record.action}</td>
+                          <td className="p-3">{record.name || record.uid || '-'}</td>
+                          <td className="p-3">{record.targetName || record.targetUid || '-'}</td>
+                          <td className="p-3">{record.ip || '-'}</td>
+                          <td className="p-3 max-w-[360px] truncate" title={JSON.stringify(record.detail || {})}>
+                            {JSON.stringify(record.detail || {})}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className={`border ${THEME.border} ${THEME.bgPanel}`}>
+                  <div className={`border-b ${THEME.border} p-3 text-xs ${THEME.textDim} flex items-center gap-2`}>
+                    <FileText size={14} /> 聊天记录
+                  </div>
+                  <div className="p-3 space-y-2 text-xs max-h-80 overflow-y-auto">
+                    {(roomDetail.messages || []).slice(-80).reverse().map((message) => (
+                      <div key={message.id || `${message.sender}-${message.timestamp}`} className={`border ${THEME.border} p-2`}>
+                        <div className={`${THEME.textDim} mb-1`}>
+                          {formatDateTime(message.timestamp)} · {message.sender} · {message.type || 'message'}
+                        </div>
+                        <div className="leading-relaxed">{message.text}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </>
+            )}
+          </section>
+        </section>
+      </main>
+    </div>
+  );
+};
+
 // --- Main Application Component ---
 
-export default function App() {
+function GameApp() {
   const [user, setUser] = useState(null);
   const [username, setUsername] = useState(() => getSavedUsername());
   const [joined, setJoined] = useState(false);
@@ -2835,4 +3204,9 @@ export default function App() {
       `}</style>
     </div>
   );
+}
+
+export default function App() {
+  const isAdminPath = typeof window !== 'undefined' && window.location.pathname === '/admin';
+  return isAdminPath ? <AdminPanel /> : <GameApp />;
 }
